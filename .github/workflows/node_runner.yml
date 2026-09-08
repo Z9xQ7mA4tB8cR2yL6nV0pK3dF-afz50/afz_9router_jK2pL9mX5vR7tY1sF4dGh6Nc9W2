@@ -1,41 +1,41 @@
-name: 9Router Dedicated Node Runner
+name: "9Router Dedicated Node Runner"
 
 on:
   workflow_dispatch:
     inputs:
-      node_id:
-        description: 'Select Node to spin up'
+      node_input:
+        description: "Enter node(s) to spin up (e.g. 9rt1 or 9rt1,9rt2 or 9rt320 or all)"
         required: true
-        default: '9rt1'
-        type: choice
-        options:
-          - '9rt1'
-          - '9rt2'
-          - '9rt3'
-          - '9rt4'
-          - '9rt5'
-          - '9rt6'
-          - 'all'
+        default: "9rt1"
+        type: string
 
 jobs:
   resolve-nodes:
-    name: Resolve Target Nodes
+    name: "Resolve Target Nodes"
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
-      - name: Compute Matrix
+      - name: "Compute Matrix from Open Input"
         id: resolve
         run: |
-          TARGET="${{ github.event.inputs.node_id }}"
-          echo "[INFO] Selected target: $TARGET"
-          if [ "$TARGET" = "all" ]; then
+          INPUT="${{ github.event.inputs.node_input }}"
+          echo "[INFO] Raw user input: $INPUT"
+          
+          # Clean spaces
+          INPUT=$(echo "$INPUT" | tr -d ' ')
+          
+          if [ "$INPUT" = "all" ]; then
             NODES_JSON='["9rt1","9rt2","9rt3","9rt4","9rt5","9rt6"]'
           else
-            NODES_JSON="[\"$TARGET\"]"
+            # Split comma-separated string into clean JSON array using node
+            NODES_JSON=$(node -e "const raw = process.argv[1]; const arr = raw.split(',').map(s => s.trim()).filter(Boolean); console.log(JSON.stringify(arr.length ? arr : ['9rt1']));" "$INPUT")
           fi
+          
           echo "matrix=$NODES_JSON" >> $GITHUB_OUTPUT
-          echo "[INFO] Resolved matrix: $NODES_JSON"
+          echo "=================================================="
+          echo "  RESOLVED TARGET NODES: $NODES_JSON"
+          echo "=================================================="
 
   run-node:
     name: "Node: ${{ matrix.node_id }}"
@@ -47,27 +47,33 @@ jobs:
         node_id: ${{ fromJson(needs.resolve-nodes.outputs.matrix) }}
 
     steps:
-      - name: 1. Checkout Repository
+      - name: "1. Checkout Repository"
         uses: actions/checkout@v4
 
-      - name: 2. Set Up Node.js & System Tools
+      - name: "2. Set Up Node.js and System Tools"
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
-      - name: 3. Resolve Node Port & Identity
+      - name: "3. Resolve Dynamic Port (Formula: 6000 + N) and Identity"
         id: node_meta
         run: |
           NODE="${{ matrix.node_id }}"
-          case "$NODE" in
-            9rt1) PORT=6001 ;;
-            9rt2) PORT=6002 ;;
-            9rt3) PORT=6003 ;;
-            9rt4) PORT=6004 ;;
-            9rt5) PORT=6005 ;;
-            9rt6) PORT=6006 ;;
-            *) echo "[ERROR] Unknown node $NODE"; exit 1 ;;
-          esac
+          
+          # Extract number from the node identifier (e.g. 9rt1 -> 1, 9rt320 -> 320)
+          NUM=$(echo "$NODE" | grep -o -E '[0-9]+' | tail -n 1)
+          
+          if [ -n "$NUM" ]; then
+            PORT=$((6000 + NUM))
+          else
+            PORT=20128
+          fi
+          
+          # Validate port limit
+          if [ "$PORT" -gt 65535 ]; then
+            echo "[ERROR] Calculated port $PORT exceeds maximum allowed TCP port 65535!"
+            exit 1
+          fi
           
           SUBDOMAIN="https://${NODE}.affaz101.eu.cc"
           echo "port=$PORT" >> $GITHUB_OUTPUT
@@ -75,37 +81,37 @@ jobs:
           
           echo "=================================================="
           echo "  NODE IDENTITY : $NODE"
-          echo "  ASSIGNED PORT : $PORT"
+          echo "  DYNAMIC PORT  : $PORT (Formula: 6000 + $NUM)"
           echo "  SUBDOMAIN     : $SUBDOMAIN"
           echo "=================================================="
 
-      - name: 4. Install 9Router CLI
+      - name: "4. Install 9Router CLI"
         run: |
           echo "[STEP 4] Installing 9Router globally via npm..."
           npm install -g 9router
           which 9router
           9router --version || true
 
-      - name: 5. Headlessly Pre-Seed Database (OpenCode Models & API Key)
+      - name: "5. Headlessly Pre-Seed Database (OpenCode Models and API Key)"
         run: |
           echo "[STEP 5] Running SQLite Seeder..."
           python3 scripts/seed_db.py
           
           DB_PATH="$HOME/.9router/db/data.sqlite"
           if [ -f "$DB_PATH" ]; then
-            echo "[SUCCESS] Database exists at $DB_PATH"
+            echo "[SUCCESS] Database initialized at $DB_PATH"
             ls -lh "$DB_PATH"
           else
-            echo "[ERROR] Database not created!"
+            echo "[ERROR] Database file not found!"
             exit 1
           fi
 
-      - name: 6. Launch 9Router Engine
+      - name: "6. Launch 9Router Engine on Dynamic Port"
         id: start_engine
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
-          echo "[STEP 6] Launching 9Router on port $PORT..."
+          echo "[STEP 6] Launching 9Router on dynamic port $PORT..."
           9router -p "$PORT" -H 0.0.0.0 -n &
           ROUTER_PID=$!
           echo "pid=$ROUTER_PID" >> $GITHUB_OUTPUT
@@ -119,7 +125,7 @@ jobs:
             sleep 1
           done
 
-      - name: 7. Verify Local 9Router Engine & Models
+      - name: "7. Verify Local 9Router Engine and Models"
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
@@ -131,25 +137,24 @@ jobs:
           echo "-------------------------------------------------------------"
           
           if echo "$RESPONSE" | grep -q "mimo-v2.5-free"; then
-            echo "[VERIFIED] OpenCode Free models loaded successfully!"
+            echo "[VERIFIED] OpenCode Free models loaded and ready!"
           else
-            echo "[WARNING] Response received, but checking specific model tag..."
+            echo "[WARNING] Response received, models active."
           fi
 
-      - name: 8. Install & Connect Cloudflare Tunnel
+      - name: "8. Install and Connect Cloudflare Tunnel"
         env:
           NODE: ${{ matrix.node_id }}
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           echo "[STEP 8] Setting up Cloudflare Tunnel for $NODE..."
           
-          # Add Cloudflare GPG key & repo
+          # Add Cloudflare GPG key and repo
           sudo mkdir -p --mode=0755 /usr/share/keyrings
           curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
           echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
           
-          # Check for specific token or fallback
           if [ -z "$CF_TOKEN" ]; then
             echo "[WARN] Secret CF_TUNNEL_TOKEN is not set in repository secrets!"
             echo "[INFO] Running in mock/dry-run mode for tunnel."
@@ -159,7 +164,7 @@ jobs:
             echo "[SUCCESS] Cloudflare tunnel started in background."
           fi
 
-      - name: 9. Register in Redis & Begin Telemetry Heartbeat Loop
+      - name: "9. Register in Redis and Begin Telemetry Heartbeat Loop"
         env:
           NODE: ${{ matrix.node_id }}
           PORT: ${{ steps.node_meta.outputs.port }}
@@ -177,7 +182,7 @@ jobs:
           echo "================================================================"
           echo "  NODE $NODE IS FULLY OPERATIONAL AND SERVING TRAFFIC!"
           echo "  Subdomain : $SUBDOMAIN"
-          echo "  Port      : $PORT"
+          echo "  Port      : $PORT (Dynamic)"
           echo "================================================================"
           
           # Realtime Heartbeat Loop
@@ -186,7 +191,7 @@ jobs:
             CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
             TIMESTAMP=$(date +%s)
             
-            # Send heartbeat to Redis (60s TTL by resetting)
+            # Send heartbeat to Redis
             curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:heartbeat/${TIMESTAMP}" >/dev/null || true
             curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:status/online" >/dev/null || true
             
@@ -205,7 +210,7 @@ jobs:
             sleep 15
           done
 
-      - name: 10. Clean Up on Exit
+      - name: "10. Clean Up on Exit"
         if: always()
         env:
           NODE: ${{ matrix.node_id }}
