@@ -50,17 +50,38 @@ jobs:
       - name: "1. Checkout Repository"
         uses: actions/checkout@v4
 
-      - name: "2. Set Up Node.js and System Tools"
+      - name: "2. Set Up Python Environment"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "3. Pre-Flight Lock Check (Fast Abort)"
+        id: lock_check
+        run: |
+          echo "[STEP 3] Pre-flight checking lock for slot ${{ matrix.node_id }}..."
+          if python3 scripts/monitor.py check-lock --slot "${{ matrix.node_id }}"; then
+            echo "locked=false" >> $GITHUB_OUTPUT
+          else
+            echo "locked=true" >> $GITHUB_OUTPUT
+            echo "=================================================="
+            echo "  [ABORT] Active lock detected for ${{ matrix.node_id }}."
+            echo "  Duplicate run terminated cleanly without changes."
+            echo "=================================================="
+          fi
+
+      - name: "4. Set Up Node.js and System Tools"
+        if: steps.lock_check.outputs.locked != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: "3. Resolve Dynamic Port (Formula: 6000 + N) and Identity"
+      - name: "5. Resolve Dynamic Port (Formula: 6000 + N) and Identity"
+        if: steps.lock_check.outputs.locked != 'true'
         id: node_meta
         run: |
           NODE="${{ matrix.node_id }}"
           
-          # Extract number from the node identifier (e.g. 9rt1 -> 1, 9rt3 -> 3, 9rt320 -> 320)
+          # Extract trailing digits (e.g. 9rt2 -> 2, node-3 -> 3, 9rt320 -> 320)
           NUM=$(echo "$NODE" | grep -o -E '[0-9]+' | tail -n 1)
           
           if [ -n "$NUM" ]; then
@@ -69,15 +90,13 @@ jobs:
             PORT=20128
           fi
           
-          # Validate port limit
+          # Validate TCP port limit
           if [ "$PORT" -gt 65535 ]; then
             echo "[ERROR] Calculated port $PORT exceeds maximum allowed TCP port 65535!"
             exit 1
           fi
           
-          SUBDOMAIN="https://${NODE}.affaz101.eu.cc"
           echo "port=$PORT" >> $GITHUB_OUTPUT
-          echo "subdomain=$SUBDOMAIN" >> $GITHUB_OUTPUT
           
           # Standard API key for 9router
           API_KEY="sk-361ddf48ad95487f-l1vj9z-499b11a6"
@@ -86,20 +105,21 @@ jobs:
           echo "=================================================="
           echo "  NODE IDENTITY : $NODE"
           echo "  DYNAMIC PORT  : $PORT (Formula: 6000 + $NUM)"
-          echo "  SUBDOMAIN     : $SUBDOMAIN"
           echo "=================================================="
 
-      - name: "4. Install 9Router CLI"
+      - name: "6. Install 9Router CLI"
+        if: steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[STEP 4] Installing 9Router globally via npm..."
+          echo "[STEP 6] Installing 9Router globally via npm..."
           npm install -g 9router
           echo "[INFO] 9Router root: $(npm root -g)/9router"
 
-      - name: "5. Headlessly Pre-Seed Database (OpenCode Models and API Key)"
+      - name: "7. Headlessly Pre-Seed Database (OpenCode Models and API Key)"
+        if: steps.lock_check.outputs.locked != 'true'
         env:
           ROUTER_API_KEY: ${{ steps.node_meta.outputs.api_key }}
         run: |
-          echo "[STEP 5] Running SQLite Seeder..."
+          echo "[STEP 7] Running SQLite Seeder..."
           python3 scripts/seed_db.py
           
           DB_PATH="$HOME/.9router/db/data.sqlite"
@@ -111,16 +131,15 @@ jobs:
             exit 1
           fi
 
-      - name: "6. Launch 9Router Engine (Headless Daemon Mode)"
+      - name: "8. Launch 9Router Engine (Headless Daemon Mode)"
+        if: steps.lock_check.outputs.locked != 'true'
         id: start_engine
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
-          echo "[STEP 6] Launching 9Router server on dynamic port $PORT..."
+          echo "[STEP 8] Launching 9Router server on dynamic port $PORT..."
           
-          # Locate standalone server.js
           ROUTER_APP_DIR="$(npm root -g)/9router/app"
-          
           if [ -f "$ROUTER_APP_DIR/server.js" ]; then
             echo "[INFO] Starting standalone server from $ROUTER_APP_DIR/server.js..."
             PORT="$PORT" HOSTNAME="0.0.0.0" node "$ROUTER_APP_DIR/server.js" &
@@ -138,12 +157,13 @@ jobs:
             sleep 1
           done
 
-      - name: "7. Verify Local 9Router Engine and Models"
+      - name: "9. Verify Local 9Router Engine and Models"
+        if: steps.lock_check.outputs.locked != 'true'
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
           API_KEY: ${{ steps.node_meta.outputs.api_key }}
         run: |
-          echo "[STEP 7] Verifying 9Router models endpoint with Bearer Token..."
+          echo "[STEP 9] Verifying 9Router models endpoint with Bearer Token..."
           sleep 2
           RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "http://127.0.0.1:$PORT/v1/models" || echo "FAILED")
           echo "------------------- [MODELS API RESPONSE] -------------------"
@@ -153,17 +173,17 @@ jobs:
           if echo "$RESPONSE" | grep -q "mimo-v2.5-free"; then
             echo "[VERIFIED] OpenCode Free models loaded and ready!"
           else
-            echo "[INFO] Verified response received from models endpoint."
+            echo "[INFO] Response received from models endpoint."
           fi
 
-      - name: "8. Install and Connect Cloudflare Tunnel"
+      - name: "10. Install and Connect Cloudflare Tunnel"
+        if: steps.lock_check.outputs.locked != 'true'
         env:
           NODE: ${{ matrix.node_id }}
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          echo "[STEP 8] Setting up Cloudflare Tunnel for $NODE..."
+          echo "[STEP 10] Setting up Cloudflare Tunnel for $NODE..."
           
-          # Add Cloudflare GPG key and repo
           sudo mkdir -p --mode=0755 /usr/share/keyrings
           curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
           echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
@@ -178,59 +198,21 @@ jobs:
             echo "[SUCCESS] Cloudflare tunnel started in background."
           fi
 
-      - name: "9. Register in Redis and Begin Telemetry Heartbeat Loop"
+      - name: "11. Launch Telemetry & Lock Lease Monitor (2-Key Redis)"
+        if: steps.lock_check.outputs.locked != 'true'
         env:
           NODE: ${{ matrix.node_id }}
           PORT: ${{ steps.node_meta.outputs.port }}
-          SUBDOMAIN: ${{ steps.node_meta.outputs.subdomain }}
           API_KEY: ${{ steps.node_meta.outputs.api_key }}
-          REDIS_BASE: "https://jelab101-rimjhim.hf.space"
         run: |
-          echo "[STEP 9] Registering node $NODE in Redis at $REDIS_BASE..."
-          
-          # Initial Registration
-          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:status/online" >/dev/null || true
-          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:port/${PORT}" >/dev/null || true
-          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:subdomain/https:%2F%2F${NODE}.affaz101.eu.cc" >/dev/null || true
-          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:last_boot/$(date +%s)" >/dev/null || true
-          
-          echo "================================================================"
-          echo "  NODE $NODE IS FULLY OPERATIONAL AND SERVING TRAFFIC!"
-          echo "  Subdomain : $SUBDOMAIN"
-          echo "  Port      : $PORT (Dynamic)"
-          echo "================================================================"
-          
-          # Realtime Heartbeat Loop
-          HEARTBEAT_COUNT=0
-          while true; do
-            CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-            TIMESTAMP=$(date +%s)
-            
-            # Send heartbeat to Redis
-            curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:heartbeat/${TIMESTAMP}" >/dev/null || true
-            curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:status/online" >/dev/null || true
-            
-            HEARTBEAT_COUNT=$((HEARTBEAT_COUNT + 1))
-            
-            # Health check 9Router process with Bearer auth
-            if curl -s -H "Authorization: Bearer $API_KEY" "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
-              STATUS_FLAG="HEALTHY 🟢"
-            else
-              STATUS_FLAG="PORT UNRESPONSIVE 🔴"
-            fi
-            
-            echo "[$CURRENT_TIME] [$NODE] Heartbeat #$HEARTBEAT_COUNT | Port: $PORT | Status: $STATUS_FLAG | Tunnel: Active"
-            
-            # Sleep 15 seconds between heartbeats
-            sleep 15
-          done
+          echo "[STEP 11] Running 2-Key Telemetry & Lease Daemon for $NODE..."
+          python3 scripts/monitor.py run \
+            --slot "$NODE" \
+            --port "$PORT" \
+            --gh-run-id "${{ github.run_id }}" \
+            --api-key "$API_KEY"
 
-      - name: "10. Clean Up on Exit"
-        if: always()
-        env:
-          NODE: ${{ matrix.node_id }}
-          REDIS_BASE: "https://jelab101-rimjhim.hf.space"
+      - name: "12. Clean Up on Exit"
+        if: always() && steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[CLEANUP] Setting $NODE status to offline in Redis..."
-          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:status/offline" >/dev/null || true
-          echo "[CLEANUP] Done."
+          echo "[CLEANUP] Runner completed or terminated."
