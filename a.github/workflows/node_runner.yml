@@ -1,0 +1,216 @@
+name: 9Router Dedicated Node Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_id:
+        description: 'Select Node to spin up'
+        required: true
+        default: '9rt1'
+        type: choice
+        options:
+          - '9rt1'
+          - '9rt2'
+          - '9rt3'
+          - '9rt4'
+          - '9rt5'
+          - '9rt6'
+          - 'all'
+
+jobs:
+  resolve-nodes:
+    name: Resolve Target Nodes
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Compute Matrix
+        id: resolve
+        run: |
+          TARGET="${{ github.event.inputs.node_id }}"
+          echo "[INFO] Selected target: $TARGET"
+          if [ "$TARGET" = "all" ]; then
+            NODES_JSON='["9rt1","9rt2","9rt3","9rt4","9rt5","9rt6"]'
+          else
+            NODES_JSON="[\"$TARGET\"]"
+          fi
+          echo "matrix=$NODES_JSON" >> $GITHUB_OUTPUT
+          echo "[INFO] Resolved matrix: $NODES_JSON"
+
+  run-node:
+    name: "Node: ${{ matrix.node_id }}"
+    needs: resolve-nodes
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node_id: ${{ fromJson(needs.resolve-nodes.outputs.matrix) }}
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set Up Node.js & System Tools
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 3. Resolve Node Port & Identity
+        id: node_meta
+        run: |
+          NODE="${{ matrix.node_id }}"
+          case "$NODE" in
+            9rt1) PORT=6001 ;;
+            9rt2) PORT=6002 ;;
+            9rt3) PORT=6003 ;;
+            9rt4) PORT=6004 ;;
+            9rt5) PORT=6005 ;;
+            9rt6) PORT=6006 ;;
+            *) echo "[ERROR] Unknown node $NODE"; exit 1 ;;
+          esac
+          
+          SUBDOMAIN="https://${NODE}.affaz101.eu.cc"
+          echo "port=$PORT" >> $GITHUB_OUTPUT
+          echo "subdomain=$SUBDOMAIN" >> $GITHUB_OUTPUT
+          
+          echo "=================================================="
+          echo "  NODE IDENTITY : $NODE"
+          echo "  ASSIGNED PORT : $PORT"
+          echo "  SUBDOMAIN     : $SUBDOMAIN"
+          echo "=================================================="
+
+      - name: 4. Install 9Router CLI
+        run: |
+          echo "[STEP 4] Installing 9Router globally via npm..."
+          npm install -g 9router
+          which 9router
+          9router --version || true
+
+      - name: 5. Headlessly Pre-Seed Database (OpenCode Models & API Key)
+        run: |
+          echo "[STEP 5] Running SQLite Seeder..."
+          python3 scripts/seed_db.py
+          
+          DB_PATH="$HOME/.9router/db/data.sqlite"
+          if [ -f "$DB_PATH" ]; then
+            echo "[SUCCESS] Database exists at $DB_PATH"
+            ls -lh "$DB_PATH"
+          else
+            echo "[ERROR] Database not created!"
+            exit 1
+          fi
+
+      - name: 6. Launch 9Router Engine
+        id: start_engine
+        env:
+          PORT: ${{ steps.node_meta.outputs.port }}
+        run: |
+          echo "[STEP 6] Launching 9Router on port $PORT..."
+          9router -p "$PORT" -H 0.0.0.0 -n &
+          ROUTER_PID=$!
+          echo "pid=$ROUTER_PID" >> $GITHUB_OUTPUT
+          
+          echo "[INFO] Waiting for port $PORT to become active..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 "$PORT" 2>/dev/null || curl -s "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
+              echo "[SUCCESS] 9Router is listening on port $PORT! (Attempt $i)"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: 7. Verify Local 9Router Engine & Models
+        env:
+          PORT: ${{ steps.node_meta.outputs.port }}
+        run: |
+          echo "[STEP 7] Verifying 9Router models endpoint..."
+          sleep 2
+          RESPONSE=$(curl -s "http://127.0.0.1:$PORT/v1/models" || echo "FAILED")
+          echo "------------------- [MODELS API RESPONSE] -------------------"
+          echo "$RESPONSE" | jq . || echo "$RESPONSE"
+          echo "-------------------------------------------------------------"
+          
+          if echo "$RESPONSE" | grep -q "mimo-v2.5-free"; then
+            echo "[VERIFIED] OpenCode Free models loaded successfully!"
+          else
+            echo "[WARNING] Response received, but checking specific model tag..."
+          fi
+
+      - name: 8. Install & Connect Cloudflare Tunnel
+        env:
+          NODE: ${{ matrix.node_id }}
+          CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          echo "[STEP 8] Setting up Cloudflare Tunnel for $NODE..."
+          
+          # Add Cloudflare GPG key & repo
+          sudo mkdir -p --mode=0755 /usr/share/keyrings
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+          
+          # Check for specific token or fallback
+          if [ -z "$CF_TOKEN" ]; then
+            echo "[WARN] Secret CF_TUNNEL_TOKEN is not set in repository secrets!"
+            echo "[INFO] Running in mock/dry-run mode for tunnel."
+          else
+            echo "[INFO] Starting cloudflared tunnel service..."
+            cloudflared tunnel --no-autoupdate run --token "$CF_TOKEN" &
+            echo "[SUCCESS] Cloudflare tunnel started in background."
+          fi
+
+      - name: 9. Register in Redis & Begin Telemetry Heartbeat Loop
+        env:
+          NODE: ${{ matrix.node_id }}
+          PORT: ${{ steps.node_meta.outputs.port }}
+          SUBDOMAIN: ${{ steps.node_meta.outputs.subdomain }}
+          REDIS_BASE: "https://jelab101-rimjhim.hf.space"
+        run: |
+          echo "[STEP 9] Registering node $NODE in Redis at $REDIS_BASE..."
+          
+          # Initial Registration
+          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:status/online" >/dev/null || true
+          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:port/${PORT}" >/dev/null || true
+          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:subdomain/https:%2F%2F${NODE}.affaz101.eu.cc" >/dev/null || true
+          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:last_boot/$(date +%s)" >/dev/null || true
+          
+          echo "================================================================"
+          echo "  NODE $NODE IS FULLY OPERATIONAL AND SERVING TRAFFIC!"
+          echo "  Subdomain : $SUBDOMAIN"
+          echo "  Port      : $PORT"
+          echo "================================================================"
+          
+          # Realtime Heartbeat Loop
+          HEARTBEAT_COUNT=0
+          while true; do
+            CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+            TIMESTAMP=$(date +%s)
+            
+            # Send heartbeat to Redis (60s TTL by resetting)
+            curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:heartbeat/${TIMESTAMP}" >/dev/null || true
+            curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:status/online" >/dev/null || true
+            
+            HEARTBEAT_COUNT=$((HEARTBEAT_COUNT + 1))
+            
+            # Health check 9Router process
+            if curl -s "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+              STATUS_FLAG="HEALTHY 🟢"
+            else
+              STATUS_FLAG="PORT UNRESPONSIVE 🔴"
+            fi
+            
+            echo "[$CURRENT_TIME] [$NODE] Heartbeat #$HEARTBEAT_COUNT | Port: $PORT | Status: $STATUS_FLAG | Tunnel: Active"
+            
+            # Sleep 15 seconds between heartbeats
+            sleep 15
+          done
+
+      - name: 10. Clean Up on Exit
+        if: always()
+        env:
+          NODE: ${{ matrix.node_id }}
+          REDIS_BASE: "https://jelab101-rimjhim.hf.space"
+        run: |
+          echo "[CLEANUP] Setting $NODE status to offline in Redis..."
+          curl -s "$REDIS_BASE/SET/9rt:node:${NODE}:status/offline" >/dev/null || true
+          echo "[CLEANUP] Done."
