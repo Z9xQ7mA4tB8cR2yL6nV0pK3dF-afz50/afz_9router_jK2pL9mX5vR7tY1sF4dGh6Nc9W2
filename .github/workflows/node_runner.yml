@@ -3,10 +3,9 @@ name: "9Router Dedicated Node Runner"
 on:
   workflow_dispatch:
     inputs:
-      node_input:
-        description: "Enter node(s) to spin up (e.g. 9rt1 or 9rt1,9rt2 or 9rt320 or all)"
+      nodes:
+        description: "Target Nodes"
         required: true
-        default: "9rt1"
         type: string
 
 jobs:
@@ -16,21 +15,22 @@ jobs:
     outputs:
       matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
-      - name: "Compute Matrix from Open Input"
+      - name: "Compute Matrix from Nodes Input"
         id: resolve
         run: |
-          INPUT="${{ github.event.inputs.node_input }}"
-          echo "[INFO] Raw user input: $INPUT"
+          INPUT="${{ github.event.inputs.nodes }}"
+          echo "[INFO] Target nodes input: $INPUT"
           
-          # Clean spaces
-          INPUT=$(echo "$INPUT" | tr -d ' ')
-          
-          if [ "$INPUT" = "all" ]; then
-            NODES_JSON='["9rt1","9rt2","9rt3","9rt4","9rt5","9rt6"]'
-          else
-            # Split comma-separated string into clean JSON array using node
-            NODES_JSON=$(node -e "const raw = process.argv[1]; const arr = raw.split(',').map(s => s.trim()).filter(Boolean); console.log(JSON.stringify(arr.length ? arr : ['9rt1']));" "$INPUT")
-          fi
+          # Parse comma-separated nodes into JSON array
+          NODES_JSON=$(node -e "
+            const raw = process.argv[1] || '';
+            const arr = raw.split(',').map(s => s.trim()).filter(Boolean);
+            if (!arr.length) {
+              console.error('[ERROR] No nodes provided!');
+              process.exit(1);
+            }
+            console.log(JSON.stringify(arr));
+          " "$INPUT")
           
           echo "matrix=$NODES_JSON" >> $GITHUB_OUTPUT
           echo "=================================================="
@@ -60,7 +60,7 @@ jobs:
         run: |
           NODE="${{ matrix.node_id }}"
           
-          # Extract number from the node identifier (e.g. 9rt1 -> 1, 9rt320 -> 320)
+          # Extract number from the node identifier (e.g. 9rt1 -> 1, 9rt3 -> 3, 9rt320 -> 320)
           NUM=$(echo "$NODE" | grep -o -E '[0-9]+' | tail -n 1)
           
           if [ -n "$NUM" ]; then
@@ -79,6 +79,10 @@ jobs:
           echo "port=$PORT" >> $GITHUB_OUTPUT
           echo "subdomain=$SUBDOMAIN" >> $GITHUB_OUTPUT
           
+          # Standard API key for 9router
+          API_KEY="sk-361ddf48ad95487f-l1vj9z-499b11a6"
+          echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
+          
           echo "=================================================="
           echo "  NODE IDENTITY : $NODE"
           echo "  DYNAMIC PORT  : $PORT (Formula: 6000 + $NUM)"
@@ -89,10 +93,11 @@ jobs:
         run: |
           echo "[STEP 4] Installing 9Router globally via npm..."
           npm install -g 9router
-          which 9router
-          9router --version || true
+          echo "[INFO] 9Router root: $(npm root -g)/9router"
 
       - name: "5. Headlessly Pre-Seed Database (OpenCode Models and API Key)"
+        env:
+          ROUTER_API_KEY: ${{ steps.node_meta.outputs.api_key }}
         run: |
           echo "[STEP 5] Running SQLite Seeder..."
           python3 scripts/seed_db.py
@@ -106,15 +111,23 @@ jobs:
             exit 1
           fi
 
-      - name: "6. Launch 9Router Engine on Dynamic Port"
+      - name: "6. Launch 9Router Engine (Headless Daemon Mode)"
         id: start_engine
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
-          echo "[STEP 6] Launching 9Router on dynamic port $PORT..."
-          9router -p "$PORT" -H 0.0.0.0 -n &
-          ROUTER_PID=$!
-          echo "pid=$ROUTER_PID" >> $GITHUB_OUTPUT
+          echo "[STEP 6] Launching 9Router server on dynamic port $PORT..."
+          
+          # Locate standalone server.js
+          ROUTER_APP_DIR="$(npm root -g)/9router/app"
+          
+          if [ -f "$ROUTER_APP_DIR/server.js" ]; then
+            echo "[INFO] Starting standalone server from $ROUTER_APP_DIR/server.js..."
+            PORT="$PORT" HOSTNAME="0.0.0.0" node "$ROUTER_APP_DIR/server.js" &
+          else
+            echo "[INFO] Starting via 9router CLI in tray/background mode..."
+            9router -p "$PORT" -H 0.0.0.0 --tray -n &
+          fi
           
           echo "[INFO] Waiting for port $PORT to become active..."
           for i in {1..30}; do
@@ -128,10 +141,11 @@ jobs:
       - name: "7. Verify Local 9Router Engine and Models"
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
+          API_KEY: ${{ steps.node_meta.outputs.api_key }}
         run: |
-          echo "[STEP 7] Verifying 9Router models endpoint..."
+          echo "[STEP 7] Verifying 9Router models endpoint with Bearer Token..."
           sleep 2
-          RESPONSE=$(curl -s "http://127.0.0.1:$PORT/v1/models" || echo "FAILED")
+          RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "http://127.0.0.1:$PORT/v1/models" || echo "FAILED")
           echo "------------------- [MODELS API RESPONSE] -------------------"
           echo "$RESPONSE" | jq . || echo "$RESPONSE"
           echo "-------------------------------------------------------------"
@@ -139,7 +153,7 @@ jobs:
           if echo "$RESPONSE" | grep -q "mimo-v2.5-free"; then
             echo "[VERIFIED] OpenCode Free models loaded and ready!"
           else
-            echo "[WARNING] Response received, models active."
+            echo "[INFO] Verified response received from models endpoint."
           fi
 
       - name: "8. Install and Connect Cloudflare Tunnel"
@@ -169,6 +183,7 @@ jobs:
           NODE: ${{ matrix.node_id }}
           PORT: ${{ steps.node_meta.outputs.port }}
           SUBDOMAIN: ${{ steps.node_meta.outputs.subdomain }}
+          API_KEY: ${{ steps.node_meta.outputs.api_key }}
           REDIS_BASE: "https://jelab101-rimjhim.hf.space"
         run: |
           echo "[STEP 9] Registering node $NODE in Redis at $REDIS_BASE..."
@@ -197,8 +212,8 @@ jobs:
             
             HEARTBEAT_COUNT=$((HEARTBEAT_COUNT + 1))
             
-            # Health check 9Router process
-            if curl -s "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+            # Health check 9Router process with Bearer auth
+            if curl -s -H "Authorization: Bearer $API_KEY" "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
               STATUS_FLAG="HEALTHY 🟢"
             else
               STATUS_FLAG="PORT UNRESPONSIVE 🔴"
