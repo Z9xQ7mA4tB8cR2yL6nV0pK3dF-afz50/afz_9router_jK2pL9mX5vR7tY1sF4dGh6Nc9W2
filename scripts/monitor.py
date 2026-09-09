@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-9Router Distributed Node Monitor & Telemetry Daemon
----------------------------------------------------
+9Router Distributed Node Monitor & Telemetry Daemon (Option K: 2-Key Model)
+-------------------------------------------------------------------------
 Implements:
-1. Fast-Abort on Boot: Checks 9rt:hb:node-X for existing active lease.
-2. Deterministic Lock Lease: Claims slot using RUN_ID = f"{slot}_{boot_time}".
-3. 2-Key Architecture:
-   - 9rt:meta:node-X (Static, written once at boot)
-   - 9rt:hb:node-X   (Living heartbeat & lock, renewed every 15s with 60s TTL)
-4. Self-Suicide: Gracefully terminates if another runner claims the slot lock.
+1. 2-Key Architecture:
+   - 9rt:lock:node-X : Pure string lock lease (value: RUN_ID, TTL: 60s)
+   - 9rt:hb:node-X   : All-in-one telemetry + metadata (JSON, TTL: 60s)
+   (No separate meta key - metadata is merged directly into heartbeat!)
+2. Pre-flight Fast-Abort: Checks 9rt:lock:node-X on boot; exits immediately if locked.
+3. Self-Healing vs Self-Suicide:
+   - If 9rt:lock:node-X is deleted: Running node re-claims it (Self-Healing).
+   - If 9rt:lock:node-X is owned by another RUN_ID: Node self-terminates (Self-Suicide).
+4. Local Independence: Node stores its identity in local memory (decoupled from Redis).
 5. Zero dependencies: Standard library Python only.
 """
 
@@ -26,13 +29,7 @@ import urllib.error
 DEFAULT_REDIS_BASE = "https://jelab101-rimjhim.hf.space"
 
 def normalize_slot(raw_slot: str) -> str:
-    """
-    Normalizes slot name to canonical 'node-N' format.
-    Examples:
-      '9rt3'   -> 'node-3'
-      'node-3' -> 'node-3'
-      '3'      -> 'node-3'
-    """
+    """Normalizes slot name to canonical 'node-N' format."""
     s = raw_slot.strip().lower()
     digits = ""
     for char in reversed(s):
@@ -45,7 +42,7 @@ def normalize_slot(raw_slot: str) -> str:
     return s
 
 def calculate_port(slot: str) -> int:
-    """Calculates port based on formula: 6000 + N"""
+    """Calculates dynamic port based on formula: 6000 + N"""
     digits = "".join(filter(str.isdigit, slot))
     if digits:
         port = 6000 + int(digits)
@@ -93,12 +90,11 @@ def redis_get(redis_base: str, key: str):
         return val
     return None
 
-def redis_set(redis_base: str, key: str, value_dict: dict):
-    val_json = json.dumps(value_dict)
-    url = f"{redis_base.rstrip('/')}/SET/{urllib.parse.quote(key)}/{urllib.parse.quote(val_json)}"
+def redis_setex_str(redis_base: str, key: str, seconds: int, string_val: str):
+    url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{urllib.parse.quote(string_val)}"
     return redis_http_call(url)
 
-def redis_setex(redis_base: str, key: str, seconds: int, value_dict: dict):
+def redis_setex_json(redis_base: str, key: str, seconds: int, value_dict: dict):
     val_json = json.dumps(value_dict)
     url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{urllib.parse.quote(val_json)}"
     return redis_http_call(url)
@@ -111,42 +107,43 @@ def redis_del(redis_base: str, key: str):
 
 def cmd_check_lock(args):
     """
-    Pre-flight Lock Check:
-    Verifies if slot is already occupied.
-    Returns:
-      Exit 0: Slot is free, safe to proceed.
-      Exit 42: Slot is actively locked, abort duplicate run immediately.
+    Pre-flight Lock Check (Fast Abort):
+    Verifies 9rt:lock:node-X before heavy npm installs.
+    If --force is specified, bypasses lock check and claims slot immediately.
     """
     slot = normalize_slot(args.slot)
     redis_base = args.redis_base or DEFAULT_REDIS_BASE
-    hb_key = f"9rt:hb:{slot}"
+    lock_key = f"9rt:lock:{slot}"
 
-    print(f"[PREFLIGHT] Checking active lock for slot '{slot}' ({hb_key})...")
-    existing_hb = redis_get(redis_base, hb_key)
+    if getattr(args, "force", False):
+        print(f"[PREFLIGHT] Force flag active! Bypassing lock check for slot '{slot}'...")
+        gh_output = os.environ.get("GITHUB_OUTPUT")
+        if gh_output and os.path.exists(gh_output):
+            with open(gh_output, "a") as f:
+                f.write("is_locked=false\n")
+                f.write(f"canonical_slot={slot}\n")
+        sys.exit(0)
 
-    if existing_hb and isinstance(existing_hb, dict):
-        owner = existing_hb.get("owner_run_id", "unknown_owner")
-        pulse = existing_hb.get("pulse", 0)
-        status = existing_hb.get("status", "unknown")
-        
+    print(f"[PREFLIGHT] Checking lock for slot '{slot}' ({lock_key})...")
+    existing_lock = redis_get(redis_base, lock_key)
+
+    if existing_lock:
+        owner = str(existing_lock)
         print("=" * 65)
-        print(f"  [ABORT] SLOT IS ACTIVELY OCCUPIED!")
+        print(f"  [ABORT] SLOT IS ACTIVELY LOCKED!")
         print(f"  Slot       : {slot}")
-        print(f"  Owner Run  : {owner}")
-        print(f"  Status     : {status}")
-        print(f"  Last Pulse : {pulse}")
+        print(f"  Lock Owner : {owner}")
         print(f"  Action     : Terminating duplicate workflow run without interference.")
         print("=" * 65)
         
-        # Set GitHub Action output if in GITHUB_OUTPUT environment
         gh_output = os.environ.get("GITHUB_OUTPUT")
         if gh_output and os.path.exists(gh_output):
             with open(gh_output, "a") as f:
                 f.write("is_locked=true\n")
         
-        sys.exit(42) # Special exit code for duplicate lock abort
+        sys.exit(42) # Exit code indicating duplicate lock
     
-    print(f"[PREFLIGHT] Slot '{slot}' is completely FREE. No active lease found.")
+    print(f"[PREFLIGHT] Slot '{slot}' is completely FREE. Ready to proceed.")
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output and os.path.exists(gh_output):
         with open(gh_output, "a") as f:
@@ -156,10 +153,9 @@ def cmd_check_lock(args):
 
 def cmd_run_daemon(args):
     """
-    Main Telemetry & Lock Daemon:
-    1. Registers 9rt:meta:{slot} (once).
-    2. Continually updates 9rt:hb:{slot} with 60s TTL every 15s.
-    3. Handles self-suicide if owner_run_id is superseded.
+    Main Telemetry & Lock Lease Daemon (Option K: 2-Key Model):
+    - Key 1: 9rt:lock:node-X (Pure string lock, TTL: 60s)
+    - Key 2: 9rt:hb:node-X   (All-in-one Telemetry + Meta JSON, TTL: 60s)
     """
     slot = normalize_slot(args.slot)
     port = args.port or calculate_port(slot)
@@ -167,43 +163,42 @@ def cmd_run_daemon(args):
     gh_run_id = args.gh_run_id or os.environ.get("GITHUB_RUN_ID", "local")
     api_key = args.api_key or os.environ.get("ROUTER_API_KEY", "sk-361ddf48ad95487f-l1vj9z-499b11a6")
 
+    # Local birth certificate (Decoupled from Redis)
     boot_timestamp = int(time.time())
     run_id = f"{slot}_{boot_timestamp}"
 
-    meta_key = f"9rt:meta:{slot}"
+    lock_key = f"9rt:lock:{slot}"
     hb_key = f"9rt:hb:{slot}"
 
     print("==================================================")
-    print(f"  9ROUTER NODE MONITOR STARTING")
+    print(f"  9ROUTER NODE MONITOR STARTING (OPTION K)")
     print(f"  Canonical Slot : {slot}")
     print(f"  Dynamic Port   : {port}")
     print(f"  Session RUN_ID : {run_id}")
     print(f"  GitHub Run ID  : {gh_run_id}")
+    print(f"  Lock Key       : {lock_key}")
+    print(f"  Heartbeat Key  : {hb_key}")
     print(f"  Redis API Base : {redis_base}")
     print("==================================================")
 
-    # 1. Write Static Metadata (Once)
-    meta_payload = {
+    # 1. Initial Lock Claim (TTL: 60s)
+    print(f"[STEP] Claiming lock lease in Redis at {lock_key}...")
+    redis_setex_str(redis_base, lock_key, 60, run_id)
+
+    # 2. Initial All-in-One Heartbeat Registration (TTL: 60s)
+    hb_payload = {
         "slot": slot,
         "port": port,
         "run_id": run_id,
         "gh_run_id": gh_run_id,
         "boot_time": boot_timestamp,
-        "os": f"{platform.system()} {platform.release()}"
-    }
-    print(f"[STEP] Registering static metadata in Redis at {meta_key}...")
-    redis_set(redis_base, meta_key, meta_payload)
-
-    # Initial Lock Acquisition (TTL: 60s)
-    hb_payload = {
-        "owner_run_id": run_id,
-        "status": "online",
-        "status_msg": "Initializing 9Router engine...",
         "pulse": boot_timestamp,
-        "uptime": 0
+        "uptime": 0,
+        "status": "online",
+        "status_msg": "Initializing 9Router engine..."
     }
-    redis_setex(redis_base, hb_key, 60, hb_payload)
-    print(f"[SUCCESS] Slot lock acquired! Initial heartbeat registered in {hb_key} (TTL: 60s).")
+    redis_setex_json(redis_base, hb_key, 60, hb_payload)
+    print(f"[SUCCESS] Slot locked and initial heartbeat registered!")
 
     # Graceful Shutdown Handler
     is_running = True
@@ -211,9 +206,9 @@ def cmd_run_daemon(args):
         nonlocal is_running
         print(f"\n[SIGNAL] Received termination signal ({sig}). Cleaning up...")
         is_running = False
-        # Remove living heartbeat lock on clean shutdown so slot becomes immediately available
+        redis_del(redis_base, lock_key)
         redis_del(redis_base, hb_key)
-        print(f"[CLEANUP] Slot {slot} unlocked cleanly.")
+        print(f"[CLEANUP] Slot {slot} lock and heartbeat cleared cleanly.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -221,24 +216,32 @@ def cmd_run_daemon(args):
 
     pulse_count = 0
 
-    # 2. Main Pulse Loop (Every 15s)
+    # 3. Main Pulse Loop (Every 15s)
     while is_running:
         pulse_count += 1
         now = int(time.time())
         uptime = now - boot_timestamp
 
-        # Verify Lock Ownership (Check if superseded by newer run)
-        remote_hb = redis_get(redis_base, hb_key)
-        if remote_hb and isinstance(remote_hb, dict):
-            remote_owner = remote_hb.get("owner_run_id")
-            if remote_owner and remote_owner != run_id:
+        # --- Self-Healing vs Self-Suicide Lock Check ---
+        current_lock = redis_get(redis_base, lock_key)
+        if current_lock is not None:
+            current_owner = str(current_lock)
+            if current_owner != run_id:
+                # Lock taken over by a newer runner!
                 print("=" * 65)
-                print(f"  [SUPERSEDED] Lock stolen or taken over by newer run!")
+                print(f"  [SUPERSEDED] Lock usurped by newer runner!")
                 print(f"  Current Run : {run_id}")
-                print(f"  New Ruler   : {remote_owner}")
-                print(f"  Action      : Gracefully committing self-suicide to yield slot.")
+                print(f"  New Ruler   : {current_owner}")
+                print(f"  Action      : Committing graceful self-suicide.")
                 print("=" * 65)
                 sys.exit(0)
+            else:
+                # Still owner: renew lock TTL to 60s
+                redis_setex_str(redis_base, lock_key, 60, run_id)
+        else:
+            # Lock was deleted externally: Self-Heal and re-claim lock!
+            print(f"[SELF-HEALING] Lock key was missing. Re-claiming lock lease for {run_id}...")
+            redis_setex_str(redis_base, lock_key, 60, run_id)
 
         # Check Local 9Router Engine Health
         models_url = f"http://127.0.0.1:{port}/v1/models"
@@ -259,34 +262,39 @@ def cmd_run_daemon(args):
         status = "online" if is_healthy else "recovering"
         status_msg = "Healthy (OpenCode models active)" if is_healthy else f"Engine port {port} unresponsive"
 
-        # Renew Heartbeat and Extend Lock TTL to 60s
+        # Renew All-in-One Heartbeat (Preserving local specs + live telemetry)
         current_hb = {
-            "owner_run_id": run_id,
-            "status": status,
-            "status_msg": status_msg,
+            "slot": slot,
+            "port": port,
+            "run_id": run_id,
+            "gh_run_id": gh_run_id,
+            "boot_time": boot_timestamp,
             "pulse": now,
-            "uptime": uptime
+            "uptime": uptime,
+            "status": status,
+            "status_msg": status_msg
         }
-        redis_setex(redis_base, hb_key, 60, current_hb)
+        redis_setex_json(redis_base, hb_key, 60, current_hb)
 
-        # Formatted Console Output
+        # Console Output
         badge = "🟢 ONLINE" if is_healthy else "🟡 RECOVERING"
         time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
         print(f"[{time_str}] [{slot}] Pulse #{pulse_count:04d} | Uptime: {uptime}s | {badge} | Msg: {status_msg}")
 
-        # Sleep in 1-second chunks for responsive signal handling
+        # Sleep in 1-second chunks for responsive signal termination
         for _ in range(15):
             if not is_running:
                 break
             time.sleep(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="9Router Node Monitor & Lease Daemon")
+    parser = argparse.ArgumentParser(description="9Router Node Monitor & Lease Daemon (Option K)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Subcommand: check-lock
     p_check = subparsers.add_parser("check-lock", help="Pre-flight check if slot is actively locked")
     p_check.add_argument("--slot", required=True, help="Target slot name (e.g. 9rt3 or node-3)")
+    p_check.add_argument("--force", action="store_true", help="Force run: bypass lock check and take over slot")
     p_check.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
 
     # Subcommand: run
