@@ -7,6 +7,11 @@ on:
         description: "Target Nodes"
         required: true
         type: string
+      force:
+        description: "Force Takeover (Bypass Lock)"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   resolve-nodes:
@@ -58,8 +63,14 @@ jobs:
       - name: "3. Pre-Flight Lock Check (Fast Abort)"
         id: lock_check
         run: |
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+            echo "[INFO] Force override enabled! Bypassing lock check."
+          fi
+          
           echo "[STEP 3] Pre-flight checking lock for slot ${{ matrix.node_id }}..."
-          if python3 scripts/monitor.py check-lock --slot "${{ matrix.node_id }}"; then
+          if python3 scripts/monitor.py check-lock --slot "${{ matrix.node_id }}" $FORCE_FLAG; then
             echo "locked=false" >> $GITHUB_OUTPUT
           else
             echo "locked=true" >> $GITHUB_OUTPUT
