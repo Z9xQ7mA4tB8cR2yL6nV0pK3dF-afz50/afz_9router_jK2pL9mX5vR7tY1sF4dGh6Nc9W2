@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       nodes:
-        description: "Target Nodes"
+        description: "Target Nodes (e.g. node-1, node-2)"
         required: true
         type: string
+      node_name:
+        description: "Poetic Node Name (e.g. Sobuj Kanon)"
+        required: false
+        type: string
+        default: ""
       force:
         description: "Force Takeover (Bypass Lock)"
         required: false
@@ -92,13 +97,15 @@ jobs:
         run: |
           NODE="${{ matrix.node_id }}"
           
-          # Extract trailing digits (e.g. 9rt2 -> 2, node-3 -> 3, 9rt320 -> 320)
+          # Extract trailing digits (e.g. node-3 -> 3, 9rt2 -> 2, 3 -> 3)
           NUM=$(echo "$NODE" | grep -o -E '[0-9]+' | tail -n 1)
           
           if [ -n "$NUM" ]; then
             PORT=$((6000 + NUM))
+            CANONICAL_SLOT="node-$NUM"
           else
             PORT=20128
+            CANONICAL_SLOT="$NODE"
           fi
           
           # Validate TCP port limit
@@ -107,15 +114,27 @@ jobs:
             exit 1
           fi
           
+          BOOT_TIME=$(date +%s)
+          RUN_ID="${CANONICAL_SLOT}_${BOOT_TIME}"
+          
+          NODE_NAME="${{ github.event.inputs.node_name }}"
+          if [ -z "$NODE_NAME" ]; then
+            NODE_NAME="$CANONICAL_SLOT"
+          fi
+          
           echo "port=$PORT" >> $GITHUB_OUTPUT
+          echo "canonical_slot=$CANONICAL_SLOT" >> $GITHUB_OUTPUT
+          echo "node_name=$NODE_NAME" >> $GITHUB_OUTPUT
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
           
           # Standard API key for 9router
           API_KEY="sk-361ddf48ad95487f-l1vj9z-499b11a6"
           echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
           
           echo "=================================================="
-          echo "  NODE IDENTITY : $NODE"
-          echo "  DYNAMIC PORT  : $PORT (Formula: 6000 + $NUM)"
+          echo "  NODE IDENTITY  : $CANONICAL_SLOT ($NODE_NAME)"
+          echo "  SESSION RUN_ID : $RUN_ID"
+          echo "  DYNAMIC PORT   : $PORT (Formula: 6000 + $NUM)"
           echo "=================================================="
 
       - name: "6. Install 9Router CLI"
@@ -142,13 +161,53 @@ jobs:
             exit 1
           fi
 
+      - name: "7.5. Setup Cloudflare WARP (Local SOCKS5 Proxy Mode on 127.0.0.1:40000)"
+        if: steps.lock_check.outputs.locked != 'true'
+        run: |
+          echo "[STEP 7.5] Installing Cloudflare WARP client..."
+          sudo mkdir -p --mode=0755 /usr/share/keyrings
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+
+          echo "[INFO] Ensuring warp-svc daemon is active..."
+          sudo systemctl start warp-svc 2>/dev/null || sudo service warp-svc start 2>/dev/null || true
+          sleep 2
+
+          echo "[INFO] Registering WARP client..."
+          warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || true
+
+          echo "[INFO] Configuring WARP in SOCKS5 Proxy mode (preventing routing conflicts with cloudflared)..."
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos proxy port 40000 2>/dev/null || true
+
+          echo "[INFO] Connecting to Cloudflare WARP edge..."
+          warp-cli --accept-tos connect
+
+          # Short wait for tunnel establishment
+          for i in {1..10}; do
+            STATUS=$(warp-cli --accept-tos status 2>/dev/null || echo "")
+            if echo "$STATUS" | grep -qi "Connected"; then
+              echo "[SUCCESS] Cloudflare WARP is connected in proxy mode! (Attempt $i)"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "[INFO] Testing WARP SOCKS5 egress IP..."
+          curl -s --socks5 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=' || echo "[WARN] Trace check skipped."
+
       - name: "8. Launch 9Router Engine (Headless Daemon Mode)"
         if: steps.lock_check.outputs.locked != 'true'
         id: start_engine
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
+          ALL_PROXY: "socks5://127.0.0.1:40000"
+          HTTP_PROXY: "http://127.0.0.1:40000"
+          HTTPS_PROXY: "http://127.0.0.1:40000"
+          NO_PROXY: "localhost,127.0.0.1"
         run: |
-          echo "[STEP 8] Launching 9Router server on dynamic port $PORT..."
+          echo "[STEP 8] Launching 9Router server on dynamic port $PORT with WARP proxy..."
           
           ROUTER_APP_DIR="$(npm root -g)/9router/app"
           if [ -f "$ROUTER_APP_DIR/server.js" ]; then
@@ -187,43 +246,83 @@ jobs:
             echo "[INFO] Response received from models endpoint."
           fi
 
-      - name: "10. Install and Connect Cloudflare Tunnel"
+      - name: "10. Install and Connect Cloudflare Tunnel (Slot-Specific Dynamic Resolution)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
-          NODE: ${{ matrix.node_id }}
-          CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          NODE: ${{ steps.node_meta.outputs.canonical_slot }}
+          FALLBACK_SECRET: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          echo "[STEP 10] Setting up Cloudflare Tunnel for $NODE..."
+          echo "[STEP 10] Resolving slot-specific Cloudflare Tunnel for $NODE..."
           
           sudo mkdir -p --mode=0755 /usr/share/keyrings
           curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
           echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
           
-          if [ -z "$CF_TOKEN" ]; then
-            echo "[WARN] Secret CF_TUNNEL_TOKEN is not set in repository secrets!"
+          # 1. Dynamically query Worker for this slot's unique tunnel token
+          WORKER_URL="https://9router.cmt202150.workers.dev"
+          SLOT_TOKEN=$(curl -s --max-time 6 "$WORKER_URL/api/node/$NODE/tunnel" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || echo "")
+          
+          # 2. Direct Redis fallback if Worker query was empty
+          if [ -z "$SLOT_TOKEN" ]; then
+            REDIS_URL="https://jelab101-rimjhim.hf.space"
+            SLOT_TOKEN=$(curl -s --max-time 6 "$REDIS_URL/GET/9rt:tunnel:$NODE" 2>/dev/null | jq -r '.GET // .value // empty' 2>/dev/null || echo "")
+          fi
+          
+          # 3. Repository secret fallback
+          if [ -z "$SLOT_TOKEN" ]; then
+            SLOT_TOKEN="$FALLBACK_SECRET"
+          fi
+          
+          if [ -z "$SLOT_TOKEN" ]; then
+            echo "[WARN] No tunnel token configured for slot $NODE in Worker, Redis (9rt:tunnel:$NODE), or Secrets."
             echo "[INFO] Running in mock/dry-run mode for tunnel."
           else
-            echo "[INFO] Starting cloudflared tunnel service..."
-            cloudflared tunnel --no-autoupdate run --token "$CF_TOKEN" &
-            echo "[SUCCESS] Cloudflare tunnel started in background."
+            echo "[INFO] Slot-specific tunnel token resolved for $NODE. Starting cloudflared tunnel service..."
+            cloudflared tunnel --no-autoupdate run --token "$SLOT_TOKEN" &
+            echo "[SUCCESS] Cloudflare tunnel for $NODE started in background on dynamic port ${{ steps.node_meta.outputs.port }}."
           fi
 
       - name: "11. Launch Telemetry & Lock Lease Monitor (2-Key Redis)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
-          NODE: ${{ matrix.node_id }}
+          NODE: ${{ steps.node_meta.outputs.canonical_slot }}
+          NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           PORT: ${{ steps.node_meta.outputs.port }}
           API_KEY: ${{ steps.node_meta.outputs.api_key }}
+          RUN_ID: ${{ steps.node_meta.outputs.run_id }}
+          PYTHONUNBUFFERED: "1"
         run: |
-          echo "[STEP 11] Running 2-Key Telemetry & Lease Daemon for $NODE..."
-          python3 scripts/monitor.py run \
+          echo "[STEP 11] Running 2-Key Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
+          python3 -u scripts/monitor.py run \
             --slot "$NODE" \
+            --name "$NODE_NAME" \
             --port "$PORT" \
+            --run-id "$RUN_ID" \
             --gh-run-id "${{ github.run_id }}" \
             --api-key "$API_KEY"
 
-      - name: "12. Clean Up on Exit"
-        if: always() && steps.lock_check.outputs.locked != 'true'
+      - name: "12. Safe Clean Up on Exit (Compare-and-Delete)"
+        if: always()
         run: |
-          echo "[CLEANUP] Runner completed or terminated."
+          SLOT="${{ steps.node_meta.outputs.canonical_slot }}"
+          MY_RUN_ID="${{ steps.node_meta.outputs.run_id }}"
+          
+          # Only clean up if this runner actually booted and claimed a run_id
+          if [ -n "$SLOT" ] && [ -n "$MY_RUN_ID" ]; then
+            echo "[CLEANUP] Verifying ownership of 9rt:lock:$SLOT in Redis..."
+            REMOTE_RESP=$(curl -s "https://jelab101-rimjhim.hf.space/GET/9rt:lock:$SLOT")
+            
+            if echo "$REMOTE_RESP" | grep -q "$MY_RUN_ID"; then
+              echo "[CLEANUP] Match confirmed! Lock belongs to this runner ($MY_RUN_ID). Safe to unlock."
+              curl -s "https://jelab101-rimjhim.hf.space/DEL/9rt:lock:$SLOT" >/dev/null || true
+              curl -s "https://jelab101-rimjhim.hf.space/DEL/9rt:hb:$SLOT" >/dev/null || true
+              curl -s "https://jelab101-rimjhim.hf.space/DEL/9rt:cmd:$SLOT" >/dev/null || true
+              warp-cli --accept-tos disconnect 2>/dev/null || true
+              echo "[CLEANUP] Slot $SLOT and network sessions cleanly unlocked."
+            else
+              echo "[CLEANUP] Lock does not belong to $MY_RUN_ID (or already cleared). Leaving untouched."
+            fi
+          else
+            echo "[CLEANUP] Runner was aborted or never claimed lock. No cleanup required."
+          fi
