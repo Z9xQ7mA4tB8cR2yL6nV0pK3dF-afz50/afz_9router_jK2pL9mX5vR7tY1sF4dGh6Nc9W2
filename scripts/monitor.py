@@ -415,23 +415,24 @@ def redis_get(redis_base: str, key: str):
     return None
 
 def redis_setex_str(redis_base: str, key: str, seconds: int, string_val: str):
-    url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{urllib.parse.quote(string_val)}"
+    encoded_val = urllib.parse.quote(string_val, safe='').replace("%2F", "%252F")
+    url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key, safe='')}/{seconds}/{encoded_val}"
     return redis_http_call(url)
 
 def redis_setex_json(redis_base: str, key: str, seconds: int, value_dict: dict):
     val_json = json.dumps(value_dict)
-    encoded_val = urllib.parse.quote(val_json)
-    url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{encoded_val}"
+    encoded_val = urllib.parse.quote(val_json, safe='').replace("%2F", "%252F")
+    url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key, safe='')}/{seconds}/{encoded_val}"
     
-    # Safety guard: HTTP GET URLs must stay under 3500 characters to prevent 414 Request-URI Too Large
-    if len(url) > 3000:
+    # Safety guard: HTTP GET URLs must stay under 3000 characters to prevent 414 Request-URI Too Large
+    if len(url) > 2800:
         pruned = dict(value_dict)
         if "models" in pruned and isinstance(pruned["models"], list):
-            # Keep only compact string IDs
+            # Keep only compact string IDs up to 15
             pruned["models"] = [m["id"] if isinstance(m, dict) else str(m) for m in pruned["models"]][:15]
         val_json = json.dumps(pruned)
-        encoded_val = urllib.parse.quote(val_json)
-        url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{encoded_val}"
+        encoded_val = urllib.parse.quote(val_json, safe='').replace("%2F", "%252F")
+        url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key, safe='')}/{seconds}/{encoded_val}"
         
     return redis_http_call(url)
 
@@ -651,8 +652,11 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "models_count": len(compact_models)
         }
         res = redis_setex_json(redis_base, hb_key, 60, hb_payload)
-        if res is None:
-            log("HB_WARN", f"Failed to persist heartbeat to Redis at {hb_key}!")
+        if res is not None and isinstance(res, dict) and res.get("SETEX") == [True, "OK"]:
+            if pulse_count == 1 or pulse_count % 10 == 0:
+                log("HB_SYNC", f"Heartbeat verified in Redis ({hb_key})")
+        else:
+            log("HB_WARN", f"Redis SETEX returned non-OK status: {res} at {hb_key}")
 
         # 5. Rich Formatted Console Output
         badge = "🟢 ONLINE" if snap["is_healthy"] else f"🟡 {snap['status'].upper()}"
