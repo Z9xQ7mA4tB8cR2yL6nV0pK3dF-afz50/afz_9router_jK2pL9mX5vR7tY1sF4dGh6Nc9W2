@@ -346,17 +346,18 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         return True
 
     try:
-        # 1. Disconnect current WARP session
-        log("WARP", "Executing: warp-cli --accept-tos disconnect")
+        # 1. Force a genuine fresh Cloudflare WARP registration & session
+        log("WARP", "Re-registering WARP client identity to obtain a fresh egress IP...")
         subprocess.run([warp_bin, "--accept-tos", "disconnect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
-
-        # 2. Reconnect to obtain fresh IP from Cloudflare Anycast mesh
-        log("WARP", "Executing: warp-cli --accept-tos connect")
+        subprocess.run([warp_bin, "--accept-tos", "registration", "new"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([warp_bin, "--accept-tos", "mode", "proxy"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([warp_bin, "--accept-tos", "proxy", "port", "40000"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([warp_bin, "--accept-tos", "connect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2)
 
-        # 3. Post-rotation counter reset
+        # 2. Post-rotation counter reset
         engine.on_warp_rotated()
         state.update_health(
             is_healthy=True,
@@ -524,7 +525,8 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
 
                 try:
                     if action == "set_combo":
-                        new_models = cmd.get("models") or []
+                        raw_models = cmd.get("models") or []
+                        new_models = [urllib.parse.unquote(str(m)) for m in raw_models]
                         scripts_dir = os.path.dirname(os.path.abspath(__file__))
                         if scripts_dir not in sys.path:
                             sys.path.insert(0, scripts_dir)
@@ -671,6 +673,52 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
 
 # ----------------- Thread 2 (Main Thread): Daemon Entry -----------------
 
+def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run_id: str, port: int, gh_run_id: str):
+    """
+    Dynamic Security Handshake with Cloudflare Worker:
+    - Runs only AFTER initial lock lease and heartbeat are verified in Redis.
+    - Sends x-handshake-token + slot identity to Worker /api/node/:slot/tunnel-claim.
+    - Worker verifies active Redis lease and returns slot tunnel token from private Worker Settings.
+    - Launches cloudflared daemon in background on dynamic port.
+    """
+    if not worker_url:
+        return
+    claim_url = f"{worker_url.rstrip('/')}/api/node/{slot}/tunnel-claim"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "9Router-Runner/2.0"
+    }
+    if handshake_token:
+        headers["x-handshake-token"] = handshake_token
+    payload = {
+        "slot": slot,
+        "run_id": run_id,
+        "port": port,
+        "gh_run_id": gh_run_id
+    }
+    try:
+        log("TUNNEL", f"Initiating authenticated tunnel claim handshake with Worker at {claim_url}...")
+        req = urllib.request.Request(claim_url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+            token = data.get("token")
+            if token:
+                cloudflared_bin = shutil.which("cloudflared")
+                if cloudflared_bin:
+                    log("TUNNEL", f"Security Handshake SUCCESS! Launching Cloudflare Tunnel for {slot} (Port {port})...")
+                    cmd = [cloudflared_bin, "tunnel", "--no-autoupdate", "run", "--token", token]
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    log("TUNNEL", f"Cloudflare Tunnel active and connected in background!")
+                else:
+                    log("TUNNEL_WARN", "cloudflared binary not found on PATH. Tunnel launch skipped.")
+            else:
+                log("TUNNEL_WARN", f"Handshake response missing token: {data}")
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode() if e.fp else str(e)
+        log("TUNNEL_ERR", f"Tunnel handshake failed ({e.code}): {err_msg}")
+    except Exception as e:
+        log("TUNNEL_ERR", f"Tunnel handshake error: {e}")
+
 def cmd_run_daemon(args):
     slot = normalize_slot(args.slot)
     port = args.port or calculate_port(slot)
@@ -719,6 +767,11 @@ def cmd_run_daemon(args):
     }
     redis_setex_json(redis_base, hb_key, 60, initial_hb)
     log("INIT", f"Initial heartbeat registered in Redis.")
+
+    # Dynamic Security Handshake: Claim Cloudflare Tunnel from Worker after Heartbeat is active in Redis
+    worker_url = getattr(args, "worker_url", None) or os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev")
+    handshake_token = getattr(args, "handshake_token", None) or os.environ.get("WORKER_HANDSHAKE_TOKEN", "")
+    claim_and_start_tunnel(worker_url, handshake_token, slot, run_id, port, gh_run_id)
 
     # Initialize Rate Limit & WARP Decision Matrix Engine
     rl_engine = RateLimitDecisionEngine(boot_timestamp)
@@ -958,6 +1011,8 @@ def main():
     p_run.add_argument("--gh-run-id", help="GitHub Run ID for cancellation tracking")
     p_run.add_argument("--api-key", help="9Router master API key")
     p_run.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
+    p_run.add_argument("--worker-url", default=os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev"), help="Cloudflare Worker base URL")
+    p_run.add_argument("--handshake-token", default=os.environ.get("WORKER_HANDSHAKE_TOKEN", ""), help="Handshake token for claiming Cloudflare tunnel")
 
     # Subcommand: test-rl-matrix
     subparsers.add_parser("test-rl-matrix", help="Run automated test suite for RateLimitDecisionEngine")
