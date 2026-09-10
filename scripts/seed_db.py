@@ -25,9 +25,12 @@ BASELINE_MODELS = [
     ("ling-3.0-flash-fin-free", "Ling 3.0 Flash Free"),
 ]
 
-def get_target_db_path():
-    if len(sys.argv) > 1:
-        return sys.argv[1]
+def get_target_db_path(explicit_path=None):
+    if explicit_path:
+        return explicit_path
+    db_env = os.environ.get("ROUTER_DB_PATH")
+    if db_env:
+        return db_env
     data_dir = os.environ.get("DATA_DIR")
     if not data_dir:
         home = os.path.expanduser("~")
@@ -74,12 +77,12 @@ def fetch_live_opencode_models():
 
     return discovered if discovered else BASELINE_MODELS
 
-def seed(custom_combo=None):
-    db_path = get_target_db_path()
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    print(f"[SEED] Target Database: {db_path}")
+def seed(custom_combo=None, db_path=None):
+    target_db = get_target_db_path(db_path)
+    os.makedirs(os.path.dirname(target_db), exist_ok=True)
+    print(f"[SEED] Target Database: {target_db}")
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(target_db)
     cur = conn.cursor()
 
     # 1. Create Core 9Router SQLite Schema
@@ -180,4 +183,5 @@ def seed(custom_combo=None):
     return [m[0] if isinstance(m, tuple) else m for m in models]
 
 if __name__ == "__main__":
-    seed()
+    cli_path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
+    seed(db_path=cli_path)

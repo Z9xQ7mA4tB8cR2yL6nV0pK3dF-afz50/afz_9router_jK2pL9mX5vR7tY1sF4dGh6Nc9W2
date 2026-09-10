@@ -577,8 +577,8 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
         except Exception as e:
             log("CMD_ERR", f"Error in command consumer loop: {e}")
 
-        # Command interval strictly set to 15s (matching 15s heartbeat rhythm)
-        time.sleep(15)
+        # Fast 3-second polling cycle for immediate command execution
+        time.sleep(3)
 
 
 def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_key: str, rl_engine: RateLimitDecisionEngine = None):
