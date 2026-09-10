@@ -246,44 +246,17 @@ jobs:
             echo "[INFO] Response received from models endpoint."
           fi
 
-      - name: "10. Install and Connect Cloudflare Tunnel (Slot-Specific Dynamic Resolution)"
+      - name: "10. Install Cloudflare Tunnel Client (cloudflared)"
         if: steps.lock_check.outputs.locked != 'true'
-        env:
-          NODE: ${{ steps.node_meta.outputs.canonical_slot }}
-          FALLBACK_SECRET: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          echo "[STEP 10] Resolving slot-specific Cloudflare Tunnel for $NODE..."
-          
+          echo "[STEP 10] Installing Cloudflare Tunnel daemon (cloudflared)..."
           sudo mkdir -p --mode=0755 /usr/share/keyrings
           curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
           echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
-          
-          # 1. Dynamically query Worker for this slot's unique tunnel token
-          WORKER_URL="https://9router.cmt202150.workers.dev"
-          SLOT_TOKEN=$(curl -s --max-time 6 "$WORKER_URL/api/node/$NODE/tunnel" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || echo "")
-          
-          # 2. Direct Redis fallback if Worker query was empty
-          if [ -z "$SLOT_TOKEN" ]; then
-            REDIS_URL="https://jelab101-rimjhim.hf.space"
-            SLOT_TOKEN=$(curl -s --max-time 6 "$REDIS_URL/GET/9rt:tunnel:$NODE" 2>/dev/null | jq -r '.GET // .value // empty' 2>/dev/null || echo "")
-          fi
-          
-          # 3. Repository secret fallback
-          if [ -z "$SLOT_TOKEN" ]; then
-            SLOT_TOKEN="$FALLBACK_SECRET"
-          fi
-          
-          if [ -z "$SLOT_TOKEN" ]; then
-            echo "[WARN] No tunnel token configured for slot $NODE in Worker, Redis (9rt:tunnel:$NODE), or Secrets."
-            echo "[INFO] Running in mock/dry-run mode for tunnel."
-          else
-            echo "[INFO] Slot-specific tunnel token resolved for $NODE. Starting cloudflared tunnel service..."
-            cloudflared tunnel --no-autoupdate run --token "$SLOT_TOKEN" &
-            echo "[SUCCESS] Cloudflare tunnel for $NODE started in background on dynamic port ${{ steps.node_meta.outputs.port }}."
-          fi
+          echo "[SUCCESS] cloudflared $(cloudflared --version) installed and ready for authenticated handshake."
 
-      - name: "11. Launch Telemetry & Lock Lease Monitor (2-Key Redis)"
+      - name: "11. Launch Telemetry, Authenticated Tunnel Handshake & Lease Daemon"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           NODE: ${{ steps.node_meta.outputs.canonical_slot }}
@@ -291,6 +264,8 @@ jobs:
           PORT: ${{ steps.node_meta.outputs.port }}
           API_KEY: ${{ steps.node_meta.outputs.api_key }}
           RUN_ID: ${{ steps.node_meta.outputs.run_id }}
+          WORKER_URL: "https://9router.cmt202150.workers.dev"
+          WORKER_HANDSHAKE_TOKEN: ${{ secrets.WORKER_HANDSHAKE_TOKEN || secrets.ADMIN_SECRET || '' }}
           PYTHONUNBUFFERED: "1"
         run: |
           echo "[STEP 11] Running 2-Key Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
@@ -300,7 +275,9 @@ jobs:
             --port "$PORT" \
             --run-id "$RUN_ID" \
             --gh-run-id "${{ github.run_id }}" \
-            --api-key "$API_KEY"
+            --api-key "$API_KEY" \
+            --worker-url "$WORKER_URL" \
+            --handshake-token "$WORKER_HANDSHAKE_TOKEN"
 
       - name: "12. Safe Clean Up on Exit (Compare-and-Delete)"
         if: always()
