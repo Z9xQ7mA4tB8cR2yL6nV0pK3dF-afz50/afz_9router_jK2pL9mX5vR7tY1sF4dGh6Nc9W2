@@ -425,8 +425,8 @@ def redis_setex_json(redis_base: str, key: str, seconds: int, value_dict: dict):
     encoded_val = urllib.parse.quote(val_json, safe='').replace("%2F", "%252F")
     url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key, safe='')}/{seconds}/{encoded_val}"
     
-    # Safety guard: HTTP GET URLs must stay under 3000 characters to prevent 414 Request-URI Too Large
-    if len(url) > 2800:
+    # Safety guard: HTTP GET URLs must stay under 6000 characters to prevent 414 Request-URI Too Large
+    if len(url) > 6000:
         pruned = dict(value_dict)
         if "models" in pruned and isinstance(pruned["models"], list):
             # Keep only compact string IDs up to 15
@@ -534,12 +534,14 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                             import seed_db
                             applied = seed_db.seed(new_models)
                             state.update_combo(applied)
+                            discovered = snap.get("discovered_models") or []
+                            total_cnt = len(discovered) if discovered else (len(snap.get("models_list")) if snap.get("models_list") else len(applied))
                             state.update_health(
                                 is_healthy=snap["is_healthy"],
-                                models_count=len(applied),
+                                models_count=total_cnt,
                                 status=snap["status"],
                                 status_msg=f"Combo updated ({len(applied)} models active)",
-                                models_list=applied
+                                models_list=snap.get("models_list")
                             )
                             ack_payload["models"] = applied
                             ack_payload["active_combo"] = applied
@@ -850,11 +852,46 @@ def cmd_run_daemon(args):
                                 m_owner = m.get("owned_by") or m.get("provider") or "OpenCode"
                                 m_name = m.get("name") or m_id.replace("-", " ").title()
                                 
-                                # Targeted Provider Filter: focus dynamically on the active free provider tier
-                                is_target = bool(
-                                    re.search(r"free|big[-_\s]?pickle", m_id, re.IGNORECASE) or
-                                    re.search(r"free|opencode", str(m_owner), re.IGNORECASE)
+                                # =====================================================================
+                                # [FUTURE VERSION - FETCH ALL MODELS]:
+                                # To send all 600+ models without hitting the HuggingFace Redis
+                                # HTTP GET URL length limit (~6000 chars), uncomment this block
+                                # to store the complete raw catalog into a dedicated key or chunks:
+                                #
+                                # # all_models_full = []
+                                # # for raw_m in raw_items:
+                                # #     if isinstance(raw_m, dict) and raw_m.get("id"):
+                                # #         all_models_full.append({
+                                # #             "id": raw_m.get("id"),
+                                # #             "name": raw_m.get("name") or raw_m.get("id"),
+                                # #             "owned_by": raw_m.get("owned_by") or "unknown"
+                                # #         })
+                                # # # Push to dedicated Redis key in chunks of 40:
+                                # # chunk_size = 40
+                                # # for c_idx in range(0, len(all_models_full), chunk_size):
+                                # #     chunk = all_models_full[c_idx:c_idx + chunk_size]
+                                # #     redis_setex_json(redis_base, f"9rt:catalog:{slot}:{c_idx // chunk_size}", 300, chunk)
+                                # =====================================================================
+
+                                # Dynamic 9Router Provider Match for 'opencode-free' (Accurate, Non-Guessed):
+                                # Based on 9Router's internal catalog mapping (verified via 9router suggested-models API):
+                                # 1. Provider 'opencode-go': OpenCode official models (GLM, Kimi, MiniMax, Qwen, DeepSeek, etc.)
+                                # 2. Provider 'oc': OpenCode free & custom alias models (muse-spark, big-pickle, auto)
+                                # 3. Models with explicit ':free' or '-free' suffix (e.g. goldeneye, nemotron, kat-coder)
+                                is_opencode_provider = (
+                                    str(m_owner).lower() in ["oc", "opencode", "opencode-go", "opencode-free"] or
+                                    m_id.lower().startswith("oc/") or
+                                    m_id.lower().startswith("opencode-go/")
                                 )
+                                is_free_tier = (
+                                    m_id.lower().endswith("-free") or
+                                    "-free" in m_id.lower() or
+                                    ":free" in m_id.lower() or
+                                    "big-pickle" in m_id.lower() or
+                                    "goldeneye" in m_id.lower()
+                                )
+                                is_target = is_opencode_provider or is_free_tier
+
                                 if is_target:
                                     fresh_discovered.append({
                                         "id": m_id,
