@@ -391,11 +391,10 @@ def redis_http_call(url: str, timeout: int = 10):
             except json.JSONDecodeError:
                 return data
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
+        log("REDIS_ERR", f"HTTP {e.code} Error ({e.reason}) on {url[:80]}...")
         return None
     except Exception as e:
-        log("REDIS_ERR", f"HTTP Error on {url}: {e}")
+        log("REDIS_ERR", f"Network Error on {url[:80]}...: {e}")
         return None
 
 def redis_get(redis_base: str, key: str):
@@ -421,7 +420,19 @@ def redis_setex_str(redis_base: str, key: str, seconds: int, string_val: str):
 
 def redis_setex_json(redis_base: str, key: str, seconds: int, value_dict: dict):
     val_json = json.dumps(value_dict)
-    url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{urllib.parse.quote(val_json)}"
+    encoded_val = urllib.parse.quote(val_json)
+    url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{encoded_val}"
+    
+    # Safety guard: HTTP GET URLs must stay under 3500 characters to prevent 414 Request-URI Too Large
+    if len(url) > 3000:
+        pruned = dict(value_dict)
+        if "models" in pruned and isinstance(pruned["models"], list):
+            # Keep only compact string IDs
+            pruned["models"] = [m["id"] if isinstance(m, dict) else str(m) for m in pruned["models"]][:15]
+        val_json = json.dumps(pruned)
+        encoded_val = urllib.parse.quote(val_json)
+        url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key)}/{seconds}/{encoded_val}"
+        
     return redis_http_call(url)
 
 def redis_del(redis_base: str, key: str):
@@ -615,6 +626,13 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
 
         # 3. Renew All-in-One Heartbeat (TTL 60s)
         snap = state.get_snapshot()
+        raw_models = snap["discovered_models"] if snap["discovered_models"] else snap["models_list"]
+        compact_models = []
+        for m in raw_models:
+            mid = m["id"] if isinstance(m, dict) else str(m)
+            if mid not in compact_models:
+                compact_models.append(mid)
+
         hb_payload = {
             "slot": snap["slot"],
             "name": snap["name"],
@@ -627,11 +645,14 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "status": snap["status"],
             "status_msg": snap["status_msg"],
             "warp_ip": snap["warp_ip"],
-            "models": snap["discovered_models"] if snap["discovered_models"] else snap["models_list"],
+            "provider": "opencode-free",
+            "models": compact_models,
             "active_combo": snap["active_combo"],
-            "models_count": len(snap["discovered_models"]) if snap["discovered_models"] else len(snap["models_list"])
+            "models_count": len(compact_models)
         }
-        redis_setex_json(redis_base, hb_key, 60, hb_payload)
+        res = redis_setex_json(redis_base, hb_key, 60, hb_payload)
+        if res is None:
+            log("HB_WARN", f"Failed to persist heartbeat to Redis at {hb_key}!")
 
         # 5. Rich Formatted Console Output
         badge = "🟢 ONLINE" if snap["is_healthy"] else f"🟡 {snap['status'].upper()}"
@@ -771,12 +792,19 @@ def cmd_run_daemon(args):
                                 m_id = m.get("id")
                                 m_owner = m.get("owned_by") or m.get("provider") or "OpenCode"
                                 m_name = m.get("name") or m_id.replace("-", " ").title()
-                                fresh_discovered.append({
-                                    "id": m_id,
-                                    "name": m_name,
-                                    "provider": str(m_owner).title()
-                                })
-                                fresh_ids.append(m_id)
+                                
+                                # Targeted Provider Filter: focus dynamically on the active free provider tier
+                                is_target = bool(
+                                    re.search(r"free|big[-_\s]?pickle", m_id, re.IGNORECASE) or
+                                    re.search(r"free|opencode", str(m_owner), re.IGNORECASE)
+                                )
+                                if is_target:
+                                    fresh_discovered.append({
+                                        "id": m_id,
+                                        "name": m_name,
+                                        "provider": "OpenCode-Free"
+                                    })
+                                    fresh_ids.append(m_id)
                     except Exception:
                         pass
 
