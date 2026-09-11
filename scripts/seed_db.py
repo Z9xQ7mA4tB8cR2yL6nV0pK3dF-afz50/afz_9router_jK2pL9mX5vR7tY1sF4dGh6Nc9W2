@@ -132,13 +132,21 @@ def seed(custom_combo=None, db_path=None):
         )
     """)
 
-    # 2. Insert Settings & Master API Key
+    # 2. Insert Settings, Active Provider Connection & Master API Key
     settings_data = {
         "providerStrategies": {},
         "quotaVisibility": {},
         "tunnelDashboardAccess": True
     }
     cur.execute("INSERT OR REPLACE INTO settings (id, data) VALUES (1, ?)", (json.dumps(settings_data),))
+    
+    # Register OpenCode Free as the sole active provider connection.
+    # This prevents 9Router from falling back to exposing all 640+ models from other providers!
+    cur.execute("""
+        INSERT OR REPLACE INTO providerConnections (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
+        VALUES ('conn-opencode-free', 'opencode', 'none', 'OpenCode Free', NULL, 1, 1, '{}', datetime('now'), datetime('now'))
+    """)
+
     api_key = os.environ.get("ROUTER_API_KEY", "sk-361ddf48ad95487f-l1vj9z-499b11a6")
     cur.execute("""
         INSERT OR REPLACE INTO apiKeys (id, key, name, machineId, isActive, createdAt)
