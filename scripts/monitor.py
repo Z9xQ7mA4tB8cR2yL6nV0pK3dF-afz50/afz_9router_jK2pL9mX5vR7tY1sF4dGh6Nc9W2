@@ -635,8 +635,12 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
         compact_models = []
         for m in raw_models:
             mid = m["id"] if isinstance(m, dict) else str(m)
-            if mid not in compact_models:
-                compact_models.append(mid)
+            # Unquote any encoded URL characters and clean prefix
+            clean_name = urllib.parse.unquote(str(mid)).strip()
+            if clean_name.lower().startswith("oc/"):
+                clean_name = clean_name[3:]
+            if clean_name and clean_name not in compact_models:
+                compact_models.append(clean_name)
 
         hb_payload = {
             "slot": snap["slot"],
@@ -850,63 +854,46 @@ def cmd_run_daemon(args):
                             if isinstance(m, dict) and m.get("id"):
                                 m_id = m.get("id")
                                 m_owner = m.get("owned_by") or m.get("provider") or "OpenCode"
-                                m_name = m.get("name") or m_id.replace("-", " ").title()
-                                
-                                # =====================================================================
-                                # [FUTURE VERSION - FETCH ALL MODELS]:
-                                # To send all 600+ models without hitting the HuggingFace Redis
-                                # HTTP GET URL length limit (~6000 chars), uncomment this block
-                                # to store the complete raw catalog into a dedicated key or chunks:
-                                #
-                                # # all_models_full = []
-                                # # for raw_m in raw_items:
-                                # #     if isinstance(raw_m, dict) and raw_m.get("id"):
-                                # #         all_models_full.append({
-                                # #             "id": raw_m.get("id"),
-                                # #             "name": raw_m.get("name") or raw_m.get("id"),
-                                # #             "owned_by": raw_m.get("owned_by") or "unknown"
-                                # #         })
-                                # # # Push to dedicated Redis key in chunks of 40:
-                                # # chunk_size = 40
-                                # # for c_idx in range(0, len(all_models_full), chunk_size):
-                                # #     chunk = all_models_full[c_idx:c_idx + chunk_size]
-                                # #     redis_setex_json(redis_base, f"9rt:catalog:{slot}:{c_idx // chunk_size}", 300, chunk)
+                                                           # =====================================================================
+                                # [FULL CATALOG CAPTURE - ALL 640+ MODELS]:
+                                # To access or push all 640+ models across all providers to a dedicated
+                                # key (e.g. 9rt:catalog:{slot}), this block captures them by provider:
+                                # # all_models_full = [m.get("id") for m in raw_items if isinstance(m, dict) and m.get("id")]
+                                # # redis_setex_json(redis_base, f"9rt:catalog:{slot}", 300, {"total": len(all_models_full), "models": all_models_full})
                                 # =====================================================================
 
-                                # Dynamic 9Router Provider Match for 'opencode-free' (Accurate, Non-Guessed):
-                                # Based on 9Router's internal catalog mapping (verified via 9router suggested-models API):
-                                # 1. Provider 'opencode-go': OpenCode official models (GLM, Kimi, MiniMax, Qwen, DeepSeek, etc.)
-                                # 2. Provider 'oc': OpenCode free & custom alias models (muse-spark, big-pickle, auto)
-                                # 3. Models with explicit ':free' or '-free' suffix (e.g. goldeneye, nemotron, kat-coder)
-                                is_opencode_provider = (
-                                    str(m_owner).lower() in ["oc", "opencode", "opencode-go", "opencode-free"] or
-                                    m_id.lower().startswith("oc/") or
-                                    m_id.lower().startswith("opencode-go/")
+                                # Dynamic 9Router Provider Match for target provider 'opencode-free':
+                                # In 9Router, 'OpenCode Free' models strictly have owned_by === 'oc' (or id prefix 'oc/')
+                                # Does NOT include paid OpenCode Go ('opencode-go'), GitHub ('gh'), Bazaarlink ('bzl'), etc.
+                                is_opencode_free = (
+                                    str(m_owner).lower() in ["oc", "opencode", "opencode-free"] or
+                                    (m_id.lower().startswith("oc/") and not m_id.lower().startswith("opencode-go/"))
                                 )
-                                is_free_tier = (
-                                    m_id.lower().endswith("-free") or
-                                    "-free" in m_id.lower() or
-                                    ":free" in m_id.lower() or
-                                    "big-pickle" in m_id.lower() or
-                                    "goldeneye" in m_id.lower()
-                                )
-                                is_target = is_opencode_provider or is_free_tier
 
-                                if is_target:
+                                if is_opencode_free:
+                                    clean_id = m_id[3:] if m_id.lower().startswith("oc/") else m_id
                                     fresh_discovered.append({
-                                        "id": m_id,
-                                        "name": m_name,
-                                        "provider": "OpenCode-Free"
+                                        "id": clean_id,
+                                        "full_id": f"oc/{clean_id}",
+                                        "name": clean_id,
+                                        "provider": "opencode-free"
                                     })
-                                    fresh_ids.append(m_id)
+                                    fresh_ids.append(clean_id)
                     except Exception:
                         pass
 
                     if fresh_ids:
                         parsed_models = fresh_ids
                         discovered_items = fresh_discovered
-                    elif not parsed_models:
-                        parsed_models = snap.get("models_list", ["big-pickle"])
+                    elif not parsed_models or parsed_models == ["big-pickle"]:
+                        try:
+                            import seed_db
+                            live_models = seed_db.fetch_live_opencode_models()
+                            if live_models:
+                                parsed_models = [m[0] if isinstance(m, tuple) else m for m in live_models]
+                                discovered_items = [{"id": mid, "name": mid, "provider": "opencode-free"} for mid in parsed_models]
+                        except Exception:
+                            parsed_models = snap.get("models_list", ["big-pickle"])
 
                     models_count = len(parsed_models)
 

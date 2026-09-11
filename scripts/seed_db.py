@@ -17,12 +17,12 @@ import urllib.error
 
 # Curated resilient baseline (guaranteed fallback if live discovery fails)
 BASELINE_MODELS = [
-    ("big-pickle", "Big Pickle Free"),
-    ("mimo-v2.5-free", "MiMo V2.5 Free"),
-    ("nemotron-3-ultra-free", "Nemotron 3 Ultra Free"),
-    ("nemotron-3.5-lightning-free", "Nemotron 3.5 Lightning Free"),
-    ("muse-spark-1.3-contributor-free", "Muse Spark 1.3 Contributor Free"),
-    ("ling-3.0-flash-fin-free", "Ling 3.0 Flash Free"),
+    ("big-pickle", "big-pickle"),
+    ("mimo-v2.5-free", "mimo-v2.5-free"),
+    ("nemotron-3-ultra-free", "nemotron-3-ultra-free"),
+    ("nemotron-3.5-lightning-free", "nemotron-3.5-lightning-free"),
+    ("muse-spark-1.3-contributor-free", "muse-spark-1.3-contributor-free"),
+    ("ling-3.0-flash-fin-free", "ling-3.0-flash-fin-free"),
 ]
 
 def get_target_db_path(explicit_path=None):
@@ -43,12 +43,15 @@ def fetch_live_opencode_models():
     Filters models matching 'free|FREE|Free' or 'big-pickle'.
     """
     endpoints = [
+        "https://opencode.ai/zen/v1/models",
         "https://opencode.ai/api/v1/models",
-        "https://opencode.ai/v1/models",
-        "https://api.opencode.ai/v1/models"
+        "https://opencode.ai/v1/models"
     ]
     discovered = []
-    headers = {"User-Agent": "9Router-Dynamic-Discovery/2.0"}
+    headers = {
+        "User-Agent": "9Router-Dynamic-Discovery/2.0",
+        "x-opencode-client": "desktop"
+    }
 
     for ep in endpoints:
         try:
@@ -59,11 +62,9 @@ def fetch_live_opencode_models():
                     raw_list = data.get("data") or data.get("models") or []
                     for m in raw_list:
                         m_id = m.get("id") or m.get("name") or ""
-                        m_name = m.get("name") or m_id
-                        # Match 'free' (case-insensitive) or 'big-pickle' / 'big pickle'
-                        if re.search(r"free|big[-_\s]?pickle", m_id, re.IGNORECASE) or \
-                           re.search(r"free|big[-_\s]?pickle", m_name, re.IGNORECASE):
-                            discovered.append((m_id, m_name))
+                        # Match 'free' (case-insensitive) or 'big-pickle'
+                        if re.search(r"free|big[-_\s]?pickle", m_id, re.IGNORECASE):
+                            discovered.append((m_id, m_id))
                     if discovered:
                         print(f"[SEED] Successfully discovered {len(discovered)} live models from {ep}")
                         break
@@ -71,9 +72,9 @@ def fetch_live_opencode_models():
             continue
 
     # Ensure 'big-pickle' is always in the list
-    has_pickle = any("big-pickle" in m[0].lower() or "big pickle" in m[0].lower() for m in discovered)
+    has_pickle = any("big-pickle" in m[0].lower() for m in discovered)
     if not has_pickle:
-        discovered.insert(0, ("big-pickle", "Big Pickle Free"))
+        discovered.insert(0, ("big-pickle", "big-pickle"))
 
     return discovered if discovered else BASELINE_MODELS
 
@@ -132,7 +133,12 @@ def seed(custom_combo=None, db_path=None):
     """)
 
     # 2. Insert Settings & Master API Key
-    cur.execute("INSERT OR REPLACE INTO settings (id, data) VALUES (1, '{\"providerStrategies\":{},\"quotaVisibility\":{}}')")
+    settings_data = {
+        "providerStrategies": {},
+        "quotaVisibility": {},
+        "tunnelDashboardAccess": True
+    }
+    cur.execute("INSERT OR REPLACE INTO settings (id, data) VALUES (1, ?)", (json.dumps(settings_data),))
     api_key = os.environ.get("ROUTER_API_KEY", "sk-361ddf48ad95487f-l1vj9z-499b11a6")
     cur.execute("""
         INSERT OR REPLACE INTO apiKeys (id, key, name, machineId, isActive, createdAt)
@@ -148,10 +154,10 @@ def seed(custom_combo=None, db_path=None):
 
     for item in models:
         if isinstance(item, tuple):
-            model_id, model_name = item
+            model_id = item[0]
         else:
             model_id = str(item)
-            model_name = str(item).replace("-", " ").title()
+        model_name = model_id
 
         kv_key = f"oc|{model_id}|llm"
         kv_val = json.dumps({
