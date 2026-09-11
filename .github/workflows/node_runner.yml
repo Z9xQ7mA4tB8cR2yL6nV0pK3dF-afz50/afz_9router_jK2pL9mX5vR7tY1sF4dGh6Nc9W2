@@ -147,7 +147,9 @@ jobs:
       - name: "7. Headlessly Pre-Seed Database (OpenCode Models and API Key)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
+          PORT: ${{ steps.node_meta.outputs.port }}
           ROUTER_API_KEY: ${{ steps.node_meta.outputs.api_key }}
+          INITIAL_PASSWORD: "affaz26.${{ steps.node_meta.outputs.port }}"
         run: |
           echo "[STEP 7] Running SQLite Seeder..."
           python3 scripts/seed_db.py
@@ -202,6 +204,7 @@ jobs:
         id: start_engine
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
+          INITIAL_PASSWORD: "affaz26.${{ steps.node_meta.outputs.port }}"
           ALL_PROXY: "socks5://127.0.0.1:40000"
           HTTP_PROXY: "http://127.0.0.1:40000"
           HTTPS_PROXY: "http://127.0.0.1:40000"
