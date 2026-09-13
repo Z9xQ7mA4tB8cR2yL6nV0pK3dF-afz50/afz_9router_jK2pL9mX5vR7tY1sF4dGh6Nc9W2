@@ -79,13 +79,50 @@ def calculate_port(slot: str) -> int:
         return port
     return 6001
 
-def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3) -> str:
+# ==============================================================================
+# CLOUDFLARE WARP GLOBAL ENDPOINT RESERVOIR (1,700+ DYNAMIC WIREGUARD EDGE POOLS)
+# ==============================================================================
+WARP_GLOBAL_SUBNETS = [
+    "188.114.96",   # Europe / Global Edge
+    "162.159.193",  # North America / Global Edge
+    "188.114.97",   # Europe East / Global Edge
+    "162.159.195",  # US West / Pacific Edge
+    "188.114.98",   # Europe Central Edge
+    "162.159.192",  # Global Anycast Core
+    "188.114.99"    # Global Alternate Edge
+]
+
+class WARPEndpointReservoir:
     """
-    Queries external IP reflection endpoint through SOCKS5 proxy to verify WARP egress IP.
+    Massive dynamic reservoir of Cloudflare WireGuard endpoints across all 7 global subnets.
+    Generates diverse candidates cycling across continents, subnets, and host allocations.
+    """
+    SUBNETS = WARP_GLOBAL_SUBNETS
+    PORTS = [2408, 500, 854, 4500]
+
+    @classmethod
+    def get_candidate(cls, rotation_index: int) -> str:
+        subnet = cls.SUBNETS[rotation_index % len(cls.SUBNETS)]
+        # Distribute host IP across 1..250 with prime stride to maximize diversity
+        host = 1 + ((rotation_index * 17 + (rotation_index // len(cls.SUBNETS))) % 250)
+        port = cls.PORTS[(rotation_index // (len(cls.SUBNETS) * 10)) % len(cls.PORTS)]
+        return f"{subnet}.{host}:{port}"
+
+    @classmethod
+    def get_batch(cls, start_index: int, count: int = 5) -> list:
+        return [cls.get_candidate(start_index + i) for i in range(count)]
+
+def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 4, max_attempts: int = 2) -> str:
+    """
+    Queries external IP reflection endpoint strictly through SOCKS5 proxy to verify WARP egress IP.
+    Avoids direct curl fallback to ensure we never mistake runner direct IP for WARP proxy IP.
     """
     endpoints = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
     curl_bin = shutil.which("curl")
-    if curl_bin:
+    if not curl_bin:
+        return "127.0.0.1"
+
+    for attempt in range(max_attempts):
         for ep in endpoints:
             try:
                 cmd = [curl_bin, "-s", "--max-time", str(timeout), "--socks5", proxy_addr, ep]
@@ -95,15 +132,8 @@ def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3)
                     return ip
             except Exception:
                 continue
-        # Fallback direct curl if WARP socks5 not up yet
-        try:
-            cmd = [curl_bin, "-s", "--max-time", str(timeout), "https://api.ipify.org"]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
-            ip = res.stdout.strip()
-            if ip and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
-                return ip
-        except Exception:
-            pass
+        if attempt < max_attempts - 1:
+            time.sleep(1)
     return "127.0.0.1"
 
 # ----------------- Thread-Safe Shared Node State -----------------
@@ -116,6 +146,7 @@ class NodeSharedState:
         self.run_id = run_id
         self.gh_run_id = gh_run_id
         self.boot_time = boot_time
+        self.endpoint_idx = 0
         
         self.lock = threading.Lock()
         self.status = "online"
@@ -314,23 +345,25 @@ class RateLimitDecisionEngine:
 
 def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "") -> bool:
     """
-    Executes Cloudflare WARP IP rotation:
-    1. Updates shared state to 'rotating_ip' so heartbeat broadcasts to Redis.
-    2. Runs warp-cli commands to disconnect and reconnect for a fresh Anycast edge IP.
-    3. Verifies new outbound IP connectivity.
-    4. Restores state to 'online' and resets rate limit engine counters.
+    Executes Cloudflare WARP IP rotation using Global Endpoint Switching & Key Rotation:
+    1. Sets shared state to 'rotating_ip'.
+    2. Cycles through distinct Cloudflare WireGuard global endpoints to force routing via a different Edge Colo.
+    3. Triggers 'tunnel rotate-keys' to refresh the cryptographic session.
+    4. Reconnects the SOCKS5 proxy with stabilization delay.
+    5. Honestly verifies outbound IP change.
     """
     snap = state.get_snapshot()
     models_cnt = snap["models_count"]
     rule_tag = f"[{rule}] " if rule else ""
+    old_ip = snap.get("warp_ip") or "127.0.0.1"
 
     state.update_health(
         is_healthy=False,
         models_count=models_cnt,
         status="rotating_ip",
-        status_msg=f"{rule_tag}Triggering Cloudflare WARP IP rotation..."
+        status_msg=f"{rule_tag}Rotating WARP egress IP across global endpoints..."
     )
-    log("WARP", f"Initiating Cloudflare WARP IP rotation {rule_tag}(Shift to W)...")
+    log("WARP", f"Initiating Cloudflare WARP global endpoint rotation {rule_tag}(Shift to W)...")
 
     warp_bin = shutil.which("warp-cli")
     if not warp_bin:
@@ -345,9 +378,63 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         )
         return True
 
+    # Multi-endpoint rotation loop: pull diverse candidates from the massive Cloudflare reservoir
+    start_idx = getattr(state, "endpoint_idx", 0)
+    candidates = WARPEndpointReservoir.get_batch(start_idx, count=5)
+
+    for attempt, target_endpoint in enumerate(candidates):
+        log("WARP", f"Rotation attempt #{attempt + 1}: Binding WARP to global endpoint {target_endpoint} from reservoir...")
+
+        try:
+            # 1. Force endpoint override to distinct Cloudflare edge subnet
+            subprocess.run([warp_bin, "--accept-tos", "tunnel", "endpoint", "set", target_endpoint], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # 2. Rotate keys to refresh WireGuard cryptographic identity
+            subprocess.run([warp_bin, "--accept-tos", "tunnel", "rotate-keys"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # 3. Disconnect & reconnect tunnel in proxy mode
+            subprocess.run([warp_bin, "--accept-tos", "disconnect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+            subprocess.run([warp_bin, "--accept-tos", "mode", "proxy"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([warp_bin, "--accept-tos", "proxy", "port", "40000"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([warp_bin, "--accept-tos", "connect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # 4. Stabilization delay for WireGuard handshake & proxy listener
+            time.sleep(3)
+
+            # 5. Detect and verify fresh egress IP (poll up to 5s)
+            fresh_ip = "127.0.0.1"
+            for _ in range(5):
+                fresh_ip = detect_warp_egress_ip(proxy_addr="127.0.0.1:40000", timeout=3, max_attempts=1)
+                if fresh_ip and fresh_ip != "127.0.0.1":
+                    break
+                time.sleep(1)
+
+            state.update_warp_ip(fresh_ip)
+
+            # 6. Verify if IP genuinely changed
+            if fresh_ip and fresh_ip != "127.0.0.1" and fresh_ip != old_ip:
+                state.endpoint_idx = start_idx + attempt + 1
+                engine.on_warp_rotated()
+                state.update_health(
+                    is_healthy=True,
+                    models_count=models_cnt,
+                    status="online",
+                    status_msg=f"Outbound IP rotated ({old_ip} -> {fresh_ip})"
+                )
+                log("WARP", f"WARP IP rotation SUCCESS: {old_ip} -> {fresh_ip} (via {target_endpoint}). Resuming normal operation.")
+                return True
+            else:
+                log("WARP_WARN", f"Attempt #{attempt + 1} with {target_endpoint} resulted in same IP ({fresh_ip}). Trying next reservoir endpoint...")
+
+        except Exception as e:
+            log("WARP_ERR", f"Error setting endpoint {target_endpoint}: {e}")
+            continue
+
+    # Fallback: reset endpoint override and perform complete registration renewal
+    log("WARP", "Attempting fallback full re-registration...")
     try:
-        # 1. Force a genuine fresh Cloudflare WARP registration & session
-        log("WARP", "Re-registering WARP client identity to obtain a fresh egress IP...")
+        subprocess.run([warp_bin, "--accept-tos", "tunnel", "endpoint", "reset"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([warp_bin, "--accept-tos", "disconnect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
@@ -355,18 +442,30 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         subprocess.run([warp_bin, "--accept-tos", "mode", "proxy"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([warp_bin, "--accept-tos", "proxy", "port", "40000"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([warp_bin, "--accept-tos", "connect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)
+        time.sleep(3)
 
-        # 2. Post-rotation counter reset
-        engine.on_warp_rotated()
-        state.update_health(
-            is_healthy=True,
-            models_count=models_cnt,
-            status="online",
-            status_msg="Outbound IP successfully rotated via WARP"
-        )
-        log("WARP", "WARP IP rotation successful! Resuming normal engine operation.")
-        return True
+        fresh_ip = detect_warp_egress_ip(proxy_addr="127.0.0.1:40000", timeout=4, max_attempts=3)
+        state.update_warp_ip(fresh_ip)
+
+        if fresh_ip and fresh_ip != "127.0.0.1" and fresh_ip != old_ip:
+            engine.on_warp_rotated()
+            state.update_health(
+                is_healthy=True,
+                models_count=models_cnt,
+                status="online",
+                status_msg=f"Outbound IP rotated ({old_ip} -> {fresh_ip})"
+            )
+            log("WARP", f"WARP fallback rotation SUCCESS: {old_ip} -> {fresh_ip}.")
+            return True
+        else:
+            state.update_health(
+                is_healthy=True,
+                models_count=models_cnt,
+                status="online",
+                status_msg=f"WARP reconnected to same edge IP ({fresh_ip})"
+            )
+            log("WARP_WARN", f"WARP reconnected to same edge pool ({fresh_ip}). Outbound IP did not change.")
+            return False
     except Exception as e:
         log("WARP_ERR", f"WARP rotation encountered error: {e}")
         state.update_health(
@@ -554,13 +653,28 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
 
                     elif action == "rotate_ip":
                         log("CMD_CONSUMER", "Executing WARP IP rotation by command...")
+                        old_ip = state.get_snapshot().get("warp_ip") or "127.0.0.1"
+                        rotated = False
                         if rl_engine:
-                            execute_warp_rotation(state, rl_engine, rule="USER_COMMAND")
-                        fresh_ip = detect_warp_egress_ip()
-                        state.update_warp_ip(fresh_ip)
-                        ack_payload["new_ip"] = fresh_ip
-                        ack_payload["message"] = f"WARP IP rotated to {fresh_ip}."
-                        log("CMD_CONSUMER", f"WARP IP rotated to: {fresh_ip}")
+                            rotated = execute_warp_rotation(state, rl_engine, rule="USER_COMMAND")
+                        else:
+                            fresh_ip = detect_warp_egress_ip()
+                            state.update_warp_ip(fresh_ip)
+                            rotated = bool(fresh_ip and fresh_ip != "127.0.0.1" and fresh_ip != old_ip)
+
+                        final_ip = state.get_snapshot().get("warp_ip") or detect_warp_egress_ip()
+                        ack_payload["old_ip"] = old_ip
+                        ack_payload["new_ip"] = final_ip
+                        ack_payload["rotated"] = rotated
+
+                        if rotated:
+                            ack_payload["status"] = "ok"
+                            ack_payload["message"] = f"WARP IP rotated from {old_ip} to {final_ip}."
+                            log("CMD_CONSUMER", f"WARP IP rotated successfully: {old_ip} -> {final_ip}")
+                        else:
+                            ack_payload["status"] = "warning"
+                            ack_payload["message"] = f"WARP reconnected to same edge pool ({final_ip}). IP did not change (rate limit may remain active)."
+                            log("CMD_CONSUMER", f"WARP rotation ineffective: IP remained {final_ip}")
 
                     else:
                         ack_payload["status"] = "ignored"
