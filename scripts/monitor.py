@@ -835,36 +835,13 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
 
 def stream_sync_worker(state: NodeSharedState, redis_base: str):
     """
-    Thread 3: Dedicated Real-Time Log Stream Sync Daemon:
-    - Publishes the runner's in-memory ring-buffer to Redis (9rt:stream:slot).
-    - Runs every 3-4 seconds so the web terminal's Stream tab displays real-time runner stdout.
-    - TTL: 60s so it automatically cleans up if runner terminates.
+    Deprecated: Real-time logs are streamed directly via gateway.js True SSE (/logs?stream=true).
+    Redis stream sync is deactivated to eliminate redundant Redis write operations.
     """
-    slot = state.slot
-    stream_key = f"9rt:stream:{slot}"
-    last_pushed_count = -1
-
-    while True:
-        snap = state.get_snapshot()
-        if not snap["is_running"]:
-            break
-        try:
-            with _LOG_BUFFER_LOCK:
-                lines = list(_LOG_BUFFER)
-
-            if len(lines) != last_pushed_count or int(time.time()) % 15 == 0:
-                last_pushed_count = len(lines)
-                payload = {
-                    "slot": slot,
-                    "run_id": snap["run_id"],
-                    "timestamp": int(time.time()),
-                    "lines": lines[-20:]
-                }
-                redis_setex_json(redis_base, stream_key, 60, payload)
-        except Exception:
-            pass
-
-        time.sleep(3.5)
+    try:
+        redis_del(redis_base, f"9rt:stream:{state.slot}")
+    except Exception:
+        pass
 
 def run_local_log_server(slot: str, port: int):
     """
@@ -972,15 +949,9 @@ def cmd_run_daemon(args):
     cmd_thread.start()
     log("INIT", "Spawned independent CommandConsumerDaemon thread.")
 
-    # Spawn Thread 3: Dedicated Real-Time Log Stream Sync (9rt:stream:slot)
-    stream_thread = threading.Thread(
-        target=stream_sync_worker,
-        args=(state, redis_base),
-        daemon=True,
-        name="LogStreamDaemon"
-    )
-    stream_thread.start()
-    log("INIT", "Spawned independent LogStreamDaemon thread (9rt:stream).")
+    # Direct True SSE is served via gateway.js (/logs?stream=true).
+    # Legacy Redis stream key (9rt:stream) is removed to avoid redundant write operations.
+    redis_del(redis_base, f"9rt:stream:{slot}")
 
     # Spawn Thread 4: Optional Local HTTP /logs Server (port + 100)
     server_thread = threading.Thread(
