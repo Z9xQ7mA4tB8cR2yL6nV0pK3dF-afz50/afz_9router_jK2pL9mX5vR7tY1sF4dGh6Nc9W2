@@ -79,8 +79,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 1. GET /logs or /stream
-  if ((pathname === "/logs" || pathname === "/stream" || pathname === "/logs/") && req.method === "GET") {
+  // 1. GET /logs
+  if ((pathname === "/logs" || pathname === "/logs/") && req.method === "GET") {
     syncFile();
     const limit = parseInt(parsed.searchParams.get("limit") || "120", 10) || 120;
     const lines = buffer.slice(-limit);
