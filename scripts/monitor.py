@@ -345,30 +345,76 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         )
         return True
 
+    def run_warp_cmd(cmd_args, input_text=None, timeout=12):
+        cmd_str = " ".join(cmd_args)
+        log("WARP_EXEC", f"Running: {cmd_str}")
+        try:
+            res = subprocess.run(
+                cmd_args,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            out = res.stdout.strip()
+            err = res.stderr.strip()
+            if out:
+                for line in out.splitlines():
+                    log("WARP_OUT", f"  {line}")
+            if err:
+                for line in err.splitlines():
+                    log("WARP_ERR_STREAM", f"  {line}")
+            log("WARP_STATUS", f"Command completed with exit code: {res.returncode}")
+            return res
+        except Exception as exc:
+            log("WARP_FAIL", f"Command execution exception: {exc}")
+            return None
+
     try:
-        # 1. Force a genuine fresh Cloudflare WARP registration & session
-        log("WARP", "Re-registering WARP client identity to obtain a fresh egress IP...")
-        subprocess.run([warp_bin, "--accept-tos", "disconnect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 1. Force a genuine fresh Cloudflare WARP registration & session with transparent logs
+        log("WARP", "Step 1/6: Disconnecting active WARP session...")
+        run_warp_cmd([warp_bin, "--accept-tos", "disconnect"])
+
+        log("WARP", "Step 2/6: Deleting previous WARP registration identity...")
+        # Send confirmation input 'y\n' in case warp-cli prompts for [y/N]
+        run_warp_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
         time.sleep(1)
-        subprocess.run([warp_bin, "--accept-tos", "registration", "new"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run([warp_bin, "--accept-tos", "mode", "proxy"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run([warp_bin, "--accept-tos", "proxy", "port", "40000"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run([warp_bin, "--accept-tos", "connect"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        log("WARP", "Step 3/6: Registering brand new WARP identity...")
+        reg_res = run_warp_cmd([warp_bin, "--accept-tos", "registration", "new"])
+        # Fallback to legacy 'register' if 'registration new' is not supported
+        if reg_res and reg_res.returncode != 0:
+            log("WARP", "Attempting fallback command: warp-cli --accept-tos register")
+            run_warp_cmd([warp_bin, "--accept-tos", "register"])
+
+        log("WARP", "Step 4/6: Setting SOCKS5 Proxy Mode...")
+        run_warp_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
+        run_warp_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
+
+        log("WARP", "Step 5/6: Connecting to Cloudflare WARP edge...")
+        run_warp_cmd([warp_bin, "--accept-tos", "connect"])
         time.sleep(2)
 
-        # 2. Post-rotation counter reset
+        log("WARP", "Step 6/6: Checking WARP client status...")
+        run_warp_cmd([warp_bin, "--accept-tos", "status"])
+
+        # 2. Probe and verify the actual resulting outbound IP
+        detected_ip = detect_warp_egress_ip()
+        log("WARP", f"Verified outbound IP after rotation: {detected_ip}")
+        state.update_warp_ip(detected_ip)
+
+        # 3. Post-rotation counter reset
         engine.on_warp_rotated()
         state.update_health(
             is_healthy=True,
             models_count=models_cnt,
             status="online",
-            status_msg="Outbound IP successfully rotated via WARP"
+            status_msg=f"Outbound IP rotated to {detected_ip}"
         )
-        log("WARP", "WARP IP rotation successful! Resuming normal engine operation.")
+        log("WARP", f"WARP IP rotation cycle completed. Egress IP is now: {detected_ip}")
         return True
     except Exception as e:
-        log("WARP_ERR", f"WARP rotation encountered error: {e}")
+        log("WARP_ERR", f"WARP rotation encountered critical exception: {e}")
         state.update_health(
             is_healthy=False,
             models_count=models_cnt,
