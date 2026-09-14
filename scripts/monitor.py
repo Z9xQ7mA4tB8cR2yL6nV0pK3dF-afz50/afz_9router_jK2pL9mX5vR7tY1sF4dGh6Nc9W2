@@ -32,6 +32,8 @@ import threading
 import subprocess
 import shutil
 import re
+import collections
+import http.server
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -42,10 +44,19 @@ if hasattr(sys.stdout, "reconfigure"):
 
 DEFAULT_REDIS_BASE = "https://jelab101-rimjhim.hf.space"
 
+_LOG_BUFFER_LOCK = threading.Lock()
+_LOG_BUFFER = collections.deque(maxlen=100)
+
 def log(tag: str, msg: str):
-    """Formatted timestamped console logger."""
+    """Formatted timestamped console logger and real-time stream ring-buffer."""
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_str}] [{tag}] {msg}", flush=True)
+    formatted = f"[{now_str}] [{tag}] {msg}"
+    print(formatted, flush=True)
+    try:
+        with _LOG_BUFFER_LOCK:
+            _LOG_BUFFER.append(formatted)
+    except Exception:
+        pass
 
 DEFAULT_SLOT_NAMES = {
     "node-1": "Norom Dupur",
@@ -831,6 +842,68 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
     except Exception as e:
         log("TUNNEL_ERR", f"Tunnel handshake error: {e}")
 
+def stream_sync_worker(state: NodeSharedState, redis_base: str):
+    """
+    Thread 3: Dedicated Real-Time Log Stream Sync Daemon:
+    - Publishes the runner's in-memory ring-buffer to Redis (9rt:stream:slot).
+    - Runs every 3-4 seconds so the web terminal's Stream tab displays real-time runner stdout.
+    - TTL: 60s so it automatically cleans up if runner terminates.
+    """
+    slot = state.slot
+    stream_key = f"9rt:stream:{slot}"
+    last_pushed_count = -1
+
+    while True:
+        snap = state.get_snapshot()
+        if not snap["is_running"]:
+            break
+        try:
+            with _LOG_BUFFER_LOCK:
+                lines = list(_LOG_BUFFER)
+
+            if len(lines) != last_pushed_count or int(time.time()) % 15 == 0:
+                last_pushed_count = len(lines)
+                payload = {
+                    "slot": slot,
+                    "run_id": snap["run_id"],
+                    "timestamp": int(time.time()),
+                    "lines": lines[-70:]
+                }
+                redis_setex_json(redis_base, stream_key, 60, payload)
+        except Exception:
+            pass
+
+        time.sleep(3.5)
+
+def run_local_log_server(slot: str, port: int):
+    """
+    Optional lightweight local HTTP /logs endpoint on the runner (port + 100).
+    """
+    class LogHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/logs", "/logs/", "/stream", "/api/logs"):
+                with _LOG_BUFFER_LOCK:
+                    lines = list(_LOG_BUFFER)
+                data = json.dumps({"slot": slot, "lines": lines[-100:]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        def log_message(self, format, *args):
+            pass
+
+    try:
+        log_port = port + 100
+        server = http.server.ThreadingHTTPServer(("0.0.0.0", log_port), LogHandler)
+        server.serve_forever()
+    except Exception:
+        pass
+
 def cmd_run_daemon(args):
     slot = normalize_slot(args.slot)
     port = args.port or calculate_port(slot)
@@ -908,13 +981,33 @@ def cmd_run_daemon(args):
     cmd_thread.start()
     log("INIT", "Spawned independent CommandConsumerDaemon thread.")
 
+    # Spawn Thread 3: Dedicated Real-Time Log Stream Sync (9rt:stream:slot)
+    stream_thread = threading.Thread(
+        target=stream_sync_worker,
+        args=(state, redis_base),
+        daemon=True,
+        name="LogStreamDaemon"
+    )
+    stream_thread.start()
+    log("INIT", "Spawned independent LogStreamDaemon thread (9rt:stream).")
+
+    # Spawn Thread 4: Optional Local HTTP /logs Server (port + 100)
+    server_thread = threading.Thread(
+        target=run_local_log_server,
+        args=(slot, port),
+        daemon=True,
+        name="LocalLogServer"
+    )
+    server_thread.start()
+
     # Graceful Signal Handling
     def handle_signal(sig, frame):
         log("SIGNAL", f"Received termination signal ({sig}). Cleaning up...")
         state.stop()
-        # Clean delete of lock and hb so slot becomes instantly free
+        # Clean delete of lock, hb, and stream so slot becomes instantly free
         redis_del(redis_base, lock_key)
         redis_del(redis_base, hb_key)
+        redis_del(redis_base, f"9rt:stream:{slot}")
         log("CLEANUP", f"Slot {slot} unlocked cleanly.")
         sys.exit(0)
 
