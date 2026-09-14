@@ -538,19 +538,31 @@ def redis_setex_str(redis_base: str, key: str, seconds: int, string_val: str):
     return redis_http_call(url)
 
 def redis_setex_json(redis_base: str, key: str, seconds: int, value_dict: dict):
-    val_json = json.dumps(value_dict)
+    pruned = dict(value_dict)
+    
+    # Pre-prune lines to max 20 and cap length of each line to 140 chars to avoid 414 Request-URI Too Large
+    if "lines" in pruned and isinstance(pruned["lines"], list):
+        pruned["lines"] = [
+            (line[:140] + "...") if isinstance(line, str) and len(line) > 140 else str(line)
+            for line in list(pruned["lines"])[-20:]
+        ]
+        
+    if "models" in pruned and isinstance(pruned["models"], list):
+        pruned["models"] = [m["id"] if isinstance(m, dict) else str(m) for m in pruned["models"]][:10]
+
+    val_json = json.dumps(pruned)
     encoded_val = urllib.parse.quote(val_json, safe='').replace("%2F", "%252F")
     url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key, safe='')}/{seconds}/{encoded_val}"
     
-    # Safety guard: HTTP GET URLs must stay under 6000 characters to prevent 414 Request-URI Too Large
-    if len(url) > 6000:
-        pruned = dict(value_dict)
-        if "models" in pruned and isinstance(pruned["models"], list):
-            # Keep only compact string IDs up to 15
-            pruned["models"] = [m["id"] if isinstance(m, dict) else str(m) for m in pruned["models"]][:15]
-        val_json = json.dumps(pruned)
-        encoded_val = urllib.parse.quote(val_json, safe='').replace("%2F", "%252F")
-        url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key, safe='')}/{seconds}/{encoded_val}"
+    # Aggressive Safety guard: HTTP GET URLs must strictly stay under 2800 characters to prevent 414 Request-URI Too Large
+    if len(url) > 2800 and "lines" in pruned and isinstance(pruned["lines"], list):
+        lines = list(pruned["lines"])
+        while lines and len(url) > 2800:
+            lines.pop(0)
+            pruned["lines"] = lines
+            val_json = json.dumps(pruned)
+            encoded_val = urllib.parse.quote(val_json, safe='').replace("%2F", "%252F")
+            url = f"{redis_base.rstrip('/')}/SETEX/{urllib.parse.quote(key, safe='')}/{seconds}/{encoded_val}"
         
     return redis_http_call(url)
 
@@ -867,7 +879,7 @@ def stream_sync_worker(state: NodeSharedState, redis_base: str):
                     "slot": slot,
                     "run_id": snap["run_id"],
                     "timestamp": int(time.time()),
-                    "lines": lines[-70:]
+                    "lines": lines[-20:]
                 }
                 redis_setex_json(redis_base, stream_key, 60, payload)
         except Exception:
