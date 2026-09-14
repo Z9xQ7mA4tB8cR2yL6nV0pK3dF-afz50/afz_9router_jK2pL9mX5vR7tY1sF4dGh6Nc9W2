@@ -78,7 +78,8 @@ def fetch_live_opencode_models():
 
     return discovered if discovered else BASELINE_MODELS
 
-def seed(custom_combo=None, db_path=None):
+def seed(custom_combo=None, db_path=None, custom_models=None):
+    custom_models = custom_models or custom_combo
     target_db = get_target_db_path(db_path)
     os.makedirs(os.path.dirname(target_db), exist_ok=True)
     print(f"[SEED] Target Database: {target_db}")
@@ -153,11 +154,8 @@ def seed(custom_combo=None, db_path=None):
         VALUES ('0243e23f-696e-4b54-a690-1ed6ed4dbb25', ?, 'Default Key', 'cloud-node', 1, datetime('now'))
     """, (api_key,))
 
-    # 3. Discover or Apply Models
-    if custom_combo:
-        cur.execute("DELETE FROM kv WHERE scope = 'customModels'")
-        print(f"[SEED] Cleared previous customModels for new combo configuration.")
-    models = custom_combo if custom_combo else fetch_live_opencode_models()
+    # 3. Register Discovered Models into 9Router
+    models = custom_models if custom_models else fetch_live_opencode_models()
     print(f"[SEED] Registering {len(models)} models into 9Router...")
 
     for item in models:
@@ -176,20 +174,6 @@ def seed(custom_combo=None, db_path=None):
         })
         cur.execute("INSERT OR REPLACE INTO kv (scope, key, value) VALUES ('customModels', ?, ?)", (kv_key, kv_val))
         print(f"  [+] Active Model: oc/{model_id}")
-
-    # 4. Smart Fallback Aliases ('default' and 'claude-3-5-sonnet' -> primary model)
-    primary_model_id = models[0][0] if isinstance(models[0], tuple) else models[0]
-    for alias in ["default", "claude-3-5-sonnet", "auto"]:
-        cur.execute("INSERT OR REPLACE INTO kv (scope, key, value) VALUES ('customModels', ?, ?)", (
-            f"oc|{alias}|llm",
-            json.dumps({
-                "providerAlias": "oc",
-                "id": alias,
-                "targetModel": primary_model_id,
-                "type": "llm",
-                "name": f"Auto Fallback -> {primary_model_id}"
-            })
-        ))
 
     conn.commit()
     conn.close()

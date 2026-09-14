@@ -138,9 +138,8 @@ class NodeSharedState:
         self.is_healthy = False
         self.active_models_count = 0
         self.warp_ip = "127.0.0.1"
-        self.models_list = ["big-pickle"]
+        self.models_list = []
         self.discovered_models = []
-        self.active_combo = ["big-pickle", "mimo-v2.5-free"]
         self.is_running = True
 
     def update_health(self, is_healthy: bool, models_count: int, status: str, status_msg: str, models_list: list = None, discovered_models: list = None):
@@ -153,10 +152,6 @@ class NodeSharedState:
                 self.models_list = models_list
             if discovered_models is not None:
                 self.discovered_models = discovered_models
-
-    def update_combo(self, combo: list):
-        with self.lock:
-            self.active_combo = list(combo)
 
     def update_warp_ip(self, ip: str):
         with self.lock:
@@ -178,7 +173,6 @@ class NodeSharedState:
                 "warp_ip": self.warp_ip,
                 "models_list": list(self.models_list),
                 "discovered_models": list(self.discovered_models),
-                "active_combo": list(self.active_combo),
                 "is_running": self.is_running
             }
 
@@ -425,58 +419,68 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         baseline_ip = probe_trace("BASELINE")
         log("WARP", f"Baseline Egress IP: {baseline_ip}")
 
-        # ======================================================================
-        # TIER 1: FAST RE-REGISTRATION (disconnect -> delete -> new -> connect)
-        # Fast 3-5 second cycle. In 90%+ cases, gives a fresh IP immediately.
-        # ======================================================================
-        log("WARP", "Step 2: Executing Tier 1 Fast Re-registration Cycle...")
-        run_cmd([warp_bin, "--accept-tos", "disconnect"])
-        run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
-        time.sleep(1)
-        reg_res = run_cmd([warp_bin, "--accept-tos", "registration", "new"])
-        if reg_res and reg_res.returncode != 0:
-            log("WARP", "Attempting fallback command: warp-cli --accept-tos register")
-            run_cmd([warp_bin, "--accept-tos", "register"])
-        run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
-        run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
-        run_cmd([warp_bin, "--accept-tos", "connect"])
-        time.sleep(2)
-        run_cmd([warp_bin, "--accept-tos", "status"])
+        final_ip = baseline_ip
+        max_attempts = 4
+        start_time = time.time()
 
-        tier1_ip = probe_trace("TIER_1")
-        log("WARP", f"Tier 1 Result: Baseline was {baseline_ip} -> New IP is {tier1_ip}")
+        for attempt in range(1, max_attempts + 1):
+            elapsed = int(time.time() - start_time)
+            log("WARP", f"--- IP Rotation Attempt #{attempt}/{max_attempts} (Elapsed: {elapsed}s) ---")
 
-        # Check if Tier 1 successfully rotated to a fresh IP
-        if tier1_ip and tier1_ip != "unknown" and tier1_ip != baseline_ip:
-            final_ip = tier1_ip
-            log("WARP", f"Tier 1 Rotation SUCCESS! IP changed from {baseline_ip} to {final_ip} (~4s).")
-        else:
-            # ==================================================================
-            # TIER 2: DEEP PURGE & CLEAN REINSTALL (Fallback Escalation)
-            # Triggers if Tier 1 hit a Cloudflare pool cooldown and returned same IP.
-            # Takes ~14-16s but guarantees complete clean slate.
-            # ==================================================================
-            log("WARP_WARN", f"Tier 1 resulted in unchanged IP ({tier1_ip}). Escalating to Tier 2 (Root Purge & Clean Reinstall)...")
-            # 1. Purge binary package
-            run_cmd(["sudo", "apt-get", "purge", "-y", "cloudflare-warp"])
-            # 2. Wipe all residual configuration, device keys, and local sockets
-            run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
-            time.sleep(1)
-            # 3. Clean reinstall from official repo
-            run_cmd(["sudo", "apt-get", "install", "-y", "-qq", "cloudflare-warp"])
-            run_cmd(["sudo", "systemctl", "start", "warp-svc"])
-            time.sleep(2)
-            # 4. Fresh registration and setup
-            run_cmd([warp_bin, "--accept-tos", "registration", "new"])
-            run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
-            run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
-            run_cmd([warp_bin, "--accept-tos", "connect"])
-            time.sleep(2)
+            if attempt == 1:
+                # Fast Re-registration Cycle (3-5s)
+                log("WARP", "Attempt 1: Fast CLI Re-registration...")
+                run_cmd([warp_bin, "--accept-tos", "disconnect"])
+                run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
+                time.sleep(2)
+                reg_res = run_cmd([warp_bin, "--accept-tos", "registration", "new"])
+                if reg_res and reg_res.returncode != 0:
+                    run_cmd([warp_bin, "--accept-tos", "register"])
+                run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
+                run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
+                run_cmd([warp_bin, "--accept-tos", "connect"])
+                time.sleep(2)
+            elif attempt == 2:
+                # Session Cooldown Backoff (6s) + Service Restart to release Anycast session
+                cooldown_sec = 6
+                log("WARP_WARN", f"Previous attempt yielded same IP ({baseline_ip}). Backing off {cooldown_sec}s for edge NAT session expiry...")
+                run_cmd([warp_bin, "--accept-tos", "disconnect"])
+                run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
+                run_cmd(["sudo", "systemctl", "restart", "warp-svc"])
+                time.sleep(cooldown_sec)
+                run_cmd([warp_bin, "--accept-tos", "registration", "new"])
+                run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
+                run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
+                run_cmd([warp_bin, "--accept-tos", "connect"])
+                time.sleep(3)
+            else:
+                # Deep Cache/State Wipe & Extended Cooldown (~8s)
+                cooldown_sec = 8
+                log("WARP_WARN", f"Attempt #{attempt}: Deep state purge & {cooldown_sec}s edge session backoff...")
+                run_cmd([warp_bin, "--accept-tos", "disconnect"])
+                run_cmd(["sudo", "systemctl", "stop", "warp-svc"])
+                run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
+                time.sleep(cooldown_sec)
+                run_cmd(["sudo", "systemctl", "start", "warp-svc"])
+                time.sleep(2)
+                run_cmd([warp_bin, "--accept-tos", "registration", "new"])
+                run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
+                run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
+                run_cmd([warp_bin, "--accept-tos", "connect"])
+                time.sleep(3)
+
             run_cmd([warp_bin, "--accept-tos", "status"])
+            cand_ip = probe_trace(f"ATTEMPT_{attempt}")
+            if cand_ip and cand_ip != "unknown" and cand_ip != baseline_ip:
+                final_ip = cand_ip
+                log("WARP", f"🎉 IP Rotation SUCCESS! IP changed from {baseline_ip} to {final_ip} (Attempt #{attempt}, Total: {int(time.time() - start_time)}s).")
+                break
+            else:
+                log("WARP_WARN", f"Attempt #{attempt} completed: IP remains {cand_ip}. Will escalate/retry...")
 
-            tier2_ip = probe_trace("TIER_2")
-            final_ip = tier2_ip if tier2_ip and tier2_ip != "unknown" else detect_warp_egress_ip()
-            log("WARP", f"Tier 2 Rotation complete. Egress IP is now: {final_ip}")
+        if final_ip == baseline_ip:
+            final_ip = detect_warp_egress_ip()
+            log("WARP_WARN", f"Rotation attempts exhausted. Final active egress IP: {final_ip}")
 
         state.update_warp_ip(final_ip)
         engine.on_warp_rotated()
@@ -657,35 +661,7 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                 }
 
                 try:
-                    if action == "set_combo":
-                        raw_models = cmd.get("models") or []
-                        new_models = [urllib.parse.unquote(str(m)) for m in raw_models]
-                        scripts_dir = os.path.dirname(os.path.abspath(__file__))
-                        if scripts_dir not in sys.path:
-                            sys.path.insert(0, scripts_dir)
-                        try:
-                            import seed_db
-                            applied = seed_db.seed(new_models)
-                            state.update_combo(applied)
-                            discovered = snap.get("discovered_models") or []
-                            total_cnt = len(discovered) if discovered else (len(snap.get("models_list")) if snap.get("models_list") else len(applied))
-                            state.update_health(
-                                is_healthy=snap["is_healthy"],
-                                models_count=total_cnt,
-                                status=snap["status"],
-                                status_msg=f"Combo updated ({len(applied)} models active)",
-                                models_list=snap.get("models_list")
-                            )
-                            ack_payload["models"] = applied
-                            ack_payload["active_combo"] = applied
-                            ack_payload["message"] = f"Successfully updated combo ({len(applied)} models)."
-                            log("CMD_CONSUMER", f"Combo successfully applied: {applied}")
-                        except Exception as seed_err:
-                            ack_payload["status"] = "error"
-                            ack_payload["error"] = str(seed_err)
-                            log("CMD_ERR", f"Failed to seed models into SQLite: {seed_err}")
-
-                    elif action == "rotate_ip":
+                    if action == "rotate_ip":
                         log("CMD_CONSUMER", "Executing WARP IP rotation by command...")
                         if rl_engine:
                             execute_warp_rotation(state, rl_engine, rule="USER_COMMAND")
@@ -697,7 +673,7 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
 
                     else:
                         ack_payload["status"] = "ignored"
-                        ack_payload["message"] = f"Action '{action}' not recognized."
+                        ack_payload["message"] = f"Action '{action}' not supported or deprecated."
 
                 except Exception as cmd_exc:
                     ack_payload["status"] = "error"
@@ -789,7 +765,6 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "warp_ip": snap["warp_ip"],
             "provider": "opencode-free",
             "models": compact_models,
-            "active_combo": snap["active_combo"],
             "models_count": len(compact_models)
         }
         res = redis_setex_json(redis_base, hb_key, 60, hb_payload)
@@ -1043,7 +1018,7 @@ def cmd_run_daemon(args):
         models_count = 0
         status = "online"
         status_msg = ""
-        parsed_models = snap.get("models_list", ["big-pickle"])
+        parsed_models = snap.get("models_list", [])
         discovered_items = snap.get("discovered_models", [])
 
         try:
@@ -1069,17 +1044,6 @@ def cmd_run_daemon(args):
                             if isinstance(m, dict) and m.get("id"):
                                 m_id = m.get("id")
                                 m_owner = m.get("owned_by") or m.get("provider") or "OpenCode"
-                                                           # =====================================================================
-                                # [FULL CATALOG CAPTURE - ALL 640+ MODELS]:
-                                # To access or push all 640+ models across all providers to a dedicated
-                                # key (e.g. 9rt:catalog:{slot}), this block captures them by provider:
-                                # # all_models_full = [m.get("id") for m in raw_items if isinstance(m, dict) and m.get("id")]
-                                # # redis_setex_json(redis_base, f"9rt:catalog:{slot}", 300, {"total": len(all_models_full), "models": all_models_full})
-                                # =====================================================================
-
-                                # Dynamic 9Router Provider Match for target provider 'opencode-free':
-                                # In 9Router, 'OpenCode Free' models strictly have owned_by === 'oc' (or id prefix 'oc/')
-                                # Does NOT include paid OpenCode Go ('opencode-go'), GitHub ('gh'), Bazaarlink ('bzl'), etc.
                                 is_opencode_free = (
                                     str(m_owner).lower() in ["oc", "opencode", "opencode-free"] or
                                     (m_id.lower().startswith("oc/") and not m_id.lower().startswith("opencode-go/"))
@@ -1100,7 +1064,7 @@ def cmd_run_daemon(args):
                     if fresh_ids:
                         parsed_models = fresh_ids
                         discovered_items = fresh_discovered
-                    elif not parsed_models or parsed_models == ["big-pickle"]:
+                    elif not parsed_models:
                         try:
                             import seed_db
                             live_models = seed_db.fetch_live_opencode_models()
@@ -1108,18 +1072,12 @@ def cmd_run_daemon(args):
                                 parsed_models = [m[0] if isinstance(m, tuple) else m for m in live_models]
                                 discovered_items = [{"id": mid, "name": mid, "provider": "opencode-free"} for mid in parsed_models]
                         except Exception:
-                            parsed_models = snap.get("models_list", ["big-pickle"])
+                            parsed_models = snap.get("models_list", [])
 
                     models_count = len(parsed_models)
-
-                    if "mimo-v2.5-free" in data:
-                        is_healthy = True
-                        status = "online"
-                        status_msg = f"Healthy ({models_count} models loaded, OpenCode active)"
-                    else:
-                        is_healthy = True
-                        status = "online"
-                        status_msg = f"Running ({models_count} models loaded)"
+                    is_healthy = True
+                    status = "online"
+                    status_msg = f"Healthy ({models_count} models loaded, OpenCode active)" if models_count > 0 else "Running (Engine active)"
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 is_healthy = False
