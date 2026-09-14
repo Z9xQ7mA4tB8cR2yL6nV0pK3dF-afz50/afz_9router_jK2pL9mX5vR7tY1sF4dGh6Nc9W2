@@ -141,11 +141,14 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
     }
     cur.execute("INSERT OR REPLACE INTO settings (id, data) VALUES (1, ?)", (json.dumps(settings_data),))
     
-    # Register OpenCode Free as the sole active provider connection.
-    # This prevents 9Router from falling back to exposing all 640+ models from other providers!
+    # Register active provider connections: OpenCode Free and API.airforce
     cur.execute("""
         INSERT OR REPLACE INTO providerConnections (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
         VALUES ('conn-opencode-free', 'opencode', 'none', 'OpenCode Free', NULL, 1, 1, '{}', datetime('now'), datetime('now'))
+    """)
+    cur.execute("""
+        INSERT OR REPLACE INTO providerConnections (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
+        VALUES ('conn-api-airforce', 'api-airforce', 'apikey', 'API.airforce', NULL, 1, 1, '{"apiKey":"free","testStatus":"active"}', datetime('now'), datetime('now'))
     """)
 
     api_key = os.environ.get("ROUTER_API_KEY", "sk-361ddf48ad95487f-l1vj9z-499b11a6")
@@ -156,7 +159,7 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
 
     # 3. Register Discovered Models into 9Router
     models = custom_models if custom_models else fetch_live_opencode_models()
-    print(f"[SEED] Registering {len(models)} models into 9Router...")
+    print(f"[SEED] Registering {len(models)} OpenCode models into 9Router...")
 
     for item in models:
         if isinstance(item, tuple):
@@ -175,9 +178,26 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
         cur.execute("INSERT OR REPLACE INTO kv (scope, key, value) VALUES ('customModels', ?, ?)", (kv_key, kv_val))
         print(f"  [+] Active Model: oc/{model_id}")
 
+    # Register API.airforce Free Models into 9Router
+    airforce_models = [
+        ("claude-3.7-sonnet", "Claude 3.7 Sonnet (Free)"),
+        ("kimi-k2.6", "Kimi K2.6 (Free)"),
+        ("gemini-2.5-flash", "Gemini 2.5 Flash (Free)")
+    ]
+    for af_id, af_name in airforce_models:
+        kv_key = f"af|{af_id}|llm"
+        kv_val = json.dumps({
+            "providerAlias": "af",
+            "id": af_id,
+            "type": "llm",
+            "name": af_name
+        })
+        cur.execute("INSERT OR REPLACE INTO kv (scope, key, value) VALUES ('customModels', ?, ?)", (kv_key, kv_val))
+        print(f"  [+] Active Model: af/{af_id}")
+
     conn.commit()
     conn.close()
-    print("[SEED] 9Router Database successfully provisioned and ready for traffic!")
+    print("[SEED] 9Router Database successfully provisioned with active targeted providers!")
     return [m[0] if isinstance(m, tuple) else m for m in models]
 
 if __name__ == "__main__":

@@ -140,9 +140,10 @@ class NodeSharedState:
         self.warp_ip = "127.0.0.1"
         self.models_list = []
         self.discovered_models = []
+        self.providers = []
         self.is_running = True
 
-    def update_health(self, is_healthy: bool, models_count: int, status: str, status_msg: str, models_list: list = None, discovered_models: list = None):
+    def update_health(self, is_healthy: bool, models_count: int, status: str, status_msg: str, models_list: list = None, discovered_models: list = None, providers: list = None):
         with self.lock:
             self.is_healthy = is_healthy
             self.active_models_count = models_count
@@ -152,6 +153,8 @@ class NodeSharedState:
                 self.models_list = models_list
             if discovered_models is not None:
                 self.discovered_models = discovered_models
+            if providers is not None:
+                self.providers = providers
 
     def update_warp_ip(self, ip: str):
         with self.lock:
@@ -173,6 +176,7 @@ class NodeSharedState:
                 "warp_ip": self.warp_ip,
                 "models_list": list(self.models_list),
                 "discovered_models": list(self.discovered_models),
+                "providers": list(self.providers),
                 "is_running": self.is_running
             }
 
@@ -740,6 +744,7 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
 
         # 3. Renew All-in-One Heartbeat (TTL 60s)
         snap = state.get_snapshot()
+        providers = snap.get("providers", [])
         raw_models = snap["discovered_models"] if snap["discovered_models"] else snap["models_list"]
         compact_models = []
         for m in raw_models:
@@ -748,8 +753,19 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             clean_name = urllib.parse.unquote(str(mid)).strip()
             if clean_name.lower().startswith("oc/"):
                 clean_name = clean_name[3:]
+            elif clean_name.lower().startswith("af/"):
+                clean_name = clean_name[3:]
             if clean_name and clean_name not in compact_models:
                 compact_models.append(clean_name)
+
+        primary_provider = providers[0]["name"] if (providers and isinstance(providers, list) and len(providers) > 0) else "opencode-free"
+        active_providers = providers if (providers and isinstance(providers, list) and len(providers) > 0) else [
+            {
+                "name": primary_provider,
+                "count": len(compact_models),
+                "models": compact_models
+            }
+        ]
 
         hb_payload = {
             "slot": snap["slot"],
@@ -763,7 +779,8 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "status": snap["status"],
             "status_msg": snap["status_msg"],
             "warp_ip": snap["warp_ip"],
-            "provider": "opencode-free",
+            "provider": primary_provider,
+            "providers": active_providers,
             "models": compact_models,
             "models_count": len(compact_models)
         }
@@ -991,6 +1008,7 @@ def cmd_run_daemon(args):
         status_msg = ""
         parsed_models = snap.get("models_list", [])
         discovered_items = snap.get("discovered_models", [])
+        discovered_providers = snap.get("providers", [])
 
         try:
             req = urllib.request.Request(
@@ -1003,6 +1021,8 @@ def cmd_run_daemon(args):
                     data = resp.read().decode("utf-8")
                     fresh_discovered = []
                     fresh_ids = []
+                    provider_groups = {}
+
                     try:
                         parsed = json.loads(data)
                         raw_items = []
@@ -1013,28 +1033,52 @@ def cmd_run_daemon(args):
 
                         for m in raw_items:
                             if isinstance(m, dict) and m.get("id"):
-                                m_id = m.get("id")
-                                m_owner = m.get("owned_by") or m.get("provider") or "OpenCode"
-                                is_opencode_free = (
-                                    str(m_owner).lower() in ["oc", "opencode", "opencode-free"] or
-                                    (m_id.lower().startswith("oc/") and not m_id.lower().startswith("opencode-go/"))
-                                )
+                                m_id = str(m.get("id")).strip()
+                                m_owner = m.get("owned_by") or m.get("provider") or ""
+                                if not m_owner and "/" in m_id:
+                                    m_owner = m_id.split("/")[0]
+                                if not m_owner:
+                                    m_owner = "opencode-free" if m_id.lower().startswith("oc/") else ("api.airforce" if m_id.lower().startswith("af/") else "opencode-free")
 
-                                if is_opencode_free:
-                                    clean_id = m_id[3:] if m_id.lower().startswith("oc/") else m_id
-                                    fresh_discovered.append({
-                                        "id": clean_id,
-                                        "full_id": f"oc/{clean_id}",
-                                        "name": clean_id,
-                                        "provider": "opencode-free"
-                                    })
+                                prov_name = str(m_owner).strip().lower()
+                                if prov_name in ["oc", "opencode"]:
+                                    prov_name = "opencode-free"
+                                elif prov_name in ["af", "airforce", "api-airforce", "api.airforce"]:
+                                    prov_name = "api.airforce"
+
+                                clean_id = m_id
+                                if clean_id.lower().startswith("oc/"):
+                                    clean_id = clean_id[3:]
+                                elif clean_id.lower().startswith("af/"):
+                                    clean_id = clean_id[3:]
+                                elif clean_id.lower().startswith(f"{prov_name}/"):
+                                    clean_id = clean_id[len(prov_name) + 1:]
+
+                                if prov_name not in provider_groups:
+                                    provider_groups[prov_name] = []
+                                if clean_id not in provider_groups[prov_name]:
+                                    provider_groups[prov_name].append(clean_id)
+
+                                fresh_discovered.append({
+                                    "id": clean_id,
+                                    "full_id": m_id,
+                                    "name": clean_id,
+                                    "provider": prov_name
+                                })
+                                if clean_id not in fresh_ids:
                                     fresh_ids.append(clean_id)
                     except Exception:
                         pass
 
+                    fresh_providers = [
+                        {"name": p_name, "count": len(p_models), "models": p_models}
+                        for p_name, p_models in provider_groups.items()
+                    ]
+
                     if fresh_ids:
                         parsed_models = fresh_ids
                         discovered_items = fresh_discovered
+                        discovered_providers = fresh_providers
                     elif not parsed_models:
                         try:
                             import seed_db
@@ -1042,13 +1086,16 @@ def cmd_run_daemon(args):
                             if live_models:
                                 parsed_models = [m[0] if isinstance(m, tuple) else m for m in live_models]
                                 discovered_items = [{"id": mid, "name": mid, "provider": "opencode-free"} for mid in parsed_models]
+                                discovered_providers = [{"name": "opencode-free", "count": len(parsed_models), "models": parsed_models}]
                         except Exception:
                             parsed_models = snap.get("models_list", [])
+                            discovered_providers = snap.get("providers", [])
 
                     models_count = len(parsed_models)
+                    prov_count = len(discovered_providers) if discovered_providers else 1
                     is_healthy = True
                     status = "online"
-                    status_msg = f"Healthy ({models_count} models loaded, OpenCode active)" if models_count > 0 else "Running (Engine active)"
+                    status_msg = f"Healthy ({models_count} models across {prov_count} provider{'s' if prov_count != 1 else ''})" if models_count > 0 else "Running (Engine active)"
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 is_healthy = False
@@ -1071,7 +1118,7 @@ def cmd_run_daemon(args):
                 else:
                     status = "cooldown"
                     status_msg = f"Cooldown {decision.wait_seconds:.0f}s ({decision.rule})"
-                    state.update_health(is_healthy, models_count, status, status_msg, models_list=parsed_models, discovered_models=discovered_items)
+                    state.update_health(is_healthy, models_count, status, status_msg, models_list=parsed_models, discovered_models=discovered_items, providers=discovered_providers)
 
                     # Sleep specified wait duration in 1s intervals
                     sleep_remaining = int(decision.wait_seconds)
@@ -1091,7 +1138,7 @@ def cmd_run_daemon(args):
             status_msg = f"Engine port {port} unresponsive"
 
         # Update Thread-Safe Shared State for the Heartbeat Worker
-        state.update_health(is_healthy, models_count, status, status_msg, models_list=parsed_models, discovered_models=discovered_items)
+        state.update_health(is_healthy, models_count, status, status_msg, models_list=parsed_models, discovered_models=discovered_items, providers=discovered_providers)
 
         # Health supervisor ticks every 5 seconds (independent of 15s heartbeat pulse)
         time.sleep(5)
