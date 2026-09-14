@@ -25,6 +25,18 @@ const LOG_FILE = getArg("--log-file", "/tmp/runner.log");
 // In-memory ring buffer for low latency
 let buffer = [];
 let fileOffset = 0;
+const sseClients = new Set();
+
+function broadcastSse(payload) {
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(data);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
 
 function syncFile() {
   try {
@@ -34,6 +46,7 @@ function syncFile() {
       // File was truncated / cleared
       fileOffset = 0;
       buffer = [];
+      broadcastSse({ type: "clear", message: "Runner log file cleared." });
     }
     if (stat.size > fileOffset) {
       const fd = fs.openSync(LOG_FILE, "r");
@@ -53,14 +66,18 @@ function syncFile() {
       if (buffer.length > 1000) {
         buffer = buffer.slice(-1000);
       }
+
+      for (const line of newLines) {
+        broadcastSse({ type: "line", text: line });
+      }
     }
   } catch (e) {
     // ignore read errors
   }
 }
 
-// Keep synced from disk every 400ms
-setInterval(syncFile, 400);
+// Keep synced from disk every 250ms for low latency
+setInterval(syncFile, 250);
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -79,9 +96,49 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 1. GET /logs
+  // 1. GET /logs -> Supports both True SSE Stream and Standard JSON snapshot
   if ((pathname === "/logs" || pathname === "/logs/") && req.method === "GET") {
     syncFile();
+    const isSse =
+      (req.headers.accept && req.headers.accept.includes("text/event-stream")) ||
+      parsed.searchParams.get("stream") === "true";
+
+    if (isSse) {
+      res.writeHead(200, {
+        ...CORS_HEADERS,
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+
+      // Send buffered history immediately to new subscriber
+      const limit = parseInt(parsed.searchParams.get("limit") || "120", 10) || 120;
+      const history = buffer.slice(-limit);
+      for (const line of history) {
+        res.write(`data: ${JSON.stringify({ type: "line", text: line })}\n\n`);
+      }
+
+      sseClients.add(res);
+
+      // Heartbeat ping every 15s to keep tunnel connection active
+      const pingTimer = setInterval(() => {
+        try {
+          res.write(": keepalive\n\n");
+        } catch {
+          clearInterval(pingTimer);
+          sseClients.delete(res);
+        }
+      }, 15000);
+
+      req.on("close", () => {
+        clearInterval(pingTimer);
+        sseClients.delete(res);
+      });
+      return;
+    }
+
+    // Standard JSON snapshot (for browser address bar / curl)
     const limit = parseInt(parsed.searchParams.get("limit") || "120", 10) || 120;
     const lines = buffer.slice(-limit);
 
@@ -114,6 +171,11 @@ const server = http.createServer((req, res) => {
         fs.writeFileSync(LOG_FILE, "");
       }
     } catch {}
+
+    broadcastSse({
+      type: "clear",
+      message: "Runner log stream buffer cleared successfully.",
+    });
 
     res.writeHead(200, {
       ...CORS_HEADERS,
