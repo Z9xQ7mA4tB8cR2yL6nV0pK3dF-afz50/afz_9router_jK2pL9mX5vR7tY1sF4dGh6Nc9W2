@@ -210,21 +210,28 @@ jobs:
           HTTPS_PROXY: "http://127.0.0.1:40000"
           NO_PROXY: "localhost,127.0.0.1"
         run: |
-          echo "[STEP 8] Launching 9Router server on dynamic port $PORT with WARP proxy..."
+          PORT="${{ steps.node_meta.outputs.port }}"
+          ENGINE_PORT=$((PORT + 500))
+          SLOT="${{ steps.node_meta.outputs.canonical_slot }}"
           
+          echo "[STEP 8] Launching 9Router on internal port $ENGINE_PORT..."
+          touch /tmp/runner.log
           ROUTER_APP_DIR="$(npm root -g)/9router/app"
           if [ -f "$ROUTER_APP_DIR/server.js" ]; then
-            echo "[INFO] Starting standalone server from $ROUTER_APP_DIR/server.js..."
-            PORT="$PORT" HOSTNAME="0.0.0.0" node "$ROUTER_APP_DIR/server.js" &
+            echo "[INFO] Starting standalone server on port $ENGINE_PORT..."
+            PORT="$ENGINE_PORT" HOSTNAME="0.0.0.0" node "$ROUTER_APP_DIR/server.js" >> /tmp/runner.log 2>&1 &
           else
-            echo "[INFO] Starting via 9router CLI in tray/background mode..."
-            9router -p "$PORT" -H 0.0.0.0 --tray -n &
+            echo "[INFO] Starting via 9router CLI in tray/background mode on port $ENGINE_PORT..."
+            9router -p "$ENGINE_PORT" -H 0.0.0.0 --tray -n >> /tmp/runner.log 2>&1 &
           fi
+          
+          echo "[INFO] Starting Local Gateway on public port $PORT (Slot: $SLOT -> Internal: $ENGINE_PORT)..."
+          node scripts/gateway.js --port "$PORT" --target-port "$ENGINE_PORT" --slot "$SLOT" &
           
           echo "[INFO] Waiting for port $PORT to become active..."
           for i in {1..30}; do
-            if nc -z 127.0.0.1 "$PORT" 2>/dev/null || curl -s "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
-              echo "[SUCCESS] 9Router is listening on port $PORT! (Attempt $i)"
+            if curl -s "http://127.0.0.1:$PORT/gateway-health" >/dev/null 2>&1 || nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+              echo "[SUCCESS] Gateway and 9Router are listening on port $PORT! (Attempt $i)"
               break
             fi
             sleep 1
