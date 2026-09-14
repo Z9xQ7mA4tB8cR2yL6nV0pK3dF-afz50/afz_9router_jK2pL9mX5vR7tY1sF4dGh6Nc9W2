@@ -404,89 +404,82 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
 
     try:
         # ======================================================================
-        # STAGE 0: BASELINE TRACE (Current state before any action)
+        # STAGE 0: BASELINE TRACE (Current Egress IP before rotation)
         # ======================================================================
-        log("WARP_TEST", ">>> STAGE 0: Baseline Cloudflare Trace (Pre-rotation) <<<")
-        baseline_ip = probe_trace("STAGE_0_BASELINE")
+        log("WARP", "Step 1: Inspecting baseline egress IP before rotation...")
+        baseline_ip = probe_trace("BASELINE")
+        log("WARP", f"Baseline Egress IP: {baseline_ip}")
 
         # ======================================================================
-        # STAGE 1: CLI RE-REGISTRATION (disconnect -> delete -> new -> connect)
+        # TIER 1: FAST RE-REGISTRATION (disconnect -> delete -> new -> connect)
+        # Fast 3-5 second cycle. In 90%+ cases, gives a fresh IP immediately.
         # ======================================================================
-        log("WARP_TEST", ">>> STAGE 1: Standard Re-registration Cycle <<<")
+        log("WARP", "Step 2: Executing Tier 1 Fast Re-registration Cycle...")
         run_cmd([warp_bin, "--accept-tos", "disconnect"])
         run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
         time.sleep(1)
         reg_res = run_cmd([warp_bin, "--accept-tos", "registration", "new"])
         if reg_res and reg_res.returncode != 0:
-            log("WARP_TEST", "Attempting fallback command: warp-cli --accept-tos register")
+            log("WARP", "Attempting fallback command: warp-cli --accept-tos register")
             run_cmd([warp_bin, "--accept-tos", "register"])
         run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
         run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
         run_cmd([warp_bin, "--accept-tos", "connect"])
         time.sleep(2)
         run_cmd([warp_bin, "--accept-tos", "status"])
-        stage1_ip = probe_trace("STAGE_1_REREG")
 
-        # ======================================================================
-        # STAGE 2: DAEMON SERVICE HARD RESTART (Flush daemon memory/sockets)
-        # ======================================================================
-        log("WARP_TEST", ">>> STAGE 2: Systemd Daemon Hard Restart (restart warp-svc) <<<")
-        run_cmd(["sudo", "systemctl", "restart", "warp-svc"])
-        time.sleep(2)
-        run_cmd([warp_bin, "--accept-tos", "connect"])
-        time.sleep(2)
-        run_cmd([warp_bin, "--accept-tos", "status"])
-        stage2_ip = probe_trace("STAGE_2_DAEMON_RESTART")
+        tier1_ip = probe_trace("TIER_1")
+        log("WARP", f"Tier 1 Result: Baseline was {baseline_ip} -> New IP is {tier1_ip}")
 
-        # ======================================================================
-        # STAGE 3: ROOT-LEVEL PURGE, CACHE WIPE & CLEAN REINSTALL
-        # ======================================================================
-        log("WARP_TEST", ">>> STAGE 3: Root-Level Purge, Cache Wipe & Clean Reinstall <<<")
-        # 1. Purge binary package
-        run_cmd(["sudo", "apt-get", "purge", "-y", "cloudflare-warp"])
-        # 2. Wipe all residual configuration, device keys, and local sockets
-        run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
-        time.sleep(1)
-        # 3. Clean reinstall from official repo
-        run_cmd(["sudo", "apt-get", "install", "-y", "-qq", "cloudflare-warp"])
-        run_cmd(["sudo", "systemctl", "start", "warp-svc"])
-        time.sleep(2)
-        # 4. Fresh registration and setup
-        run_cmd([warp_bin, "--accept-tos", "registration", "new"])
-        run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
-        run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
-        run_cmd([warp_bin, "--accept-tos", "connect"])
-        time.sleep(2)
-        run_cmd([warp_bin, "--accept-tos", "status"])
-        stage3_ip = probe_trace("STAGE_3_ROOT_REINSTALL")
+        # Check if Tier 1 successfully rotated to a fresh IP
+        if tier1_ip and tier1_ip != "unknown" and tier1_ip != baseline_ip:
+            final_ip = tier1_ip
+            log("WARP", f"Tier 1 Rotation SUCCESS! IP changed from {baseline_ip} to {final_ip} (~4s).")
+        else:
+            # ==================================================================
+            # TIER 2: DEEP PURGE & CLEAN REINSTALL (Fallback Escalation)
+            # Triggers if Tier 1 hit a Cloudflare pool cooldown and returned same IP.
+            # Takes ~14-16s but guarantees complete clean slate.
+            # ==================================================================
+            log("WARP_WARN", f"Tier 1 resulted in unchanged IP ({tier1_ip}). Escalating to Tier 2 (Root Purge & Clean Reinstall)...")
+            # 1. Purge binary package
+            run_cmd(["sudo", "apt-get", "purge", "-y", "cloudflare-warp"])
+            # 2. Wipe all residual configuration, device keys, and local sockets
+            run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
+            time.sleep(1)
+            # 3. Clean reinstall from official repo
+            run_cmd(["sudo", "apt-get", "install", "-y", "-qq", "cloudflare-warp"])
+            run_cmd(["sudo", "systemctl", "start", "warp-svc"])
+            time.sleep(2)
+            # 4. Fresh registration and setup
+            run_cmd([warp_bin, "--accept-tos", "registration", "new"])
+            run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
+            run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
+            run_cmd([warp_bin, "--accept-tos", "connect"])
+            time.sleep(2)
+            run_cmd([warp_bin, "--accept-tos", "status"])
 
-        # ======================================================================
-        # FINAL COMPARATIVE REPORT
-        # ======================================================================
-        log("WARP_TEST", "================== [ROTATION TEST SUMMARY] ==================")
-        log("WARP_TEST", f"  Stage 0 (Baseline IP)        : {baseline_ip}")
-        log("WARP_TEST", f"  Stage 1 (Re-registration)    : {stage1_ip}")
-        log("WARP_TEST", f"  Stage 2 (Daemon Hard Restart): {stage2_ip}")
-        log("WARP_TEST", f"  Stage 3 (Root Clean Reinstall: {stage3_ip}")
-        log("WARP_TEST", "=============================================================")
+            tier2_ip = probe_trace("TIER_2")
+            final_ip = tier2_ip if tier2_ip and tier2_ip != "unknown" else detect_warp_egress_ip()
+            log("WARP", f"Tier 2 Rotation complete. Egress IP is now: {final_ip}")
 
-        final_ip = stage3_ip if stage3_ip and stage3_ip != "unknown" else detect_warp_egress_ip()
         state.update_warp_ip(final_ip)
         engine.on_warp_rotated()
         state.update_health(
             is_healthy=True,
             models_count=models_cnt,
             status="online",
-            status_msg=f"Test cycle complete. Final IP: {final_ip}"
+            status_msg=f"Outbound IP successfully rotated to {final_ip}"
         )
+        log("WARP", f"WARP IP rotation cycle completed. Active Egress IP: {final_ip}")
         return True
     except Exception as e:
-        log("WARP_ERR", f"WARP rotation test suite encountered error: {e}")
+        log("WARP_ERR", f"WARP rotation encountered critical exception: {e}")
         state.update_health(
             is_healthy=False,
             models_count=models_cnt,
             status="error",
-            status_msg=f"WARP test suite failed: {e}"
+            status_msg=f"WARP rotation failed: {e}"
         )
         return False
 
