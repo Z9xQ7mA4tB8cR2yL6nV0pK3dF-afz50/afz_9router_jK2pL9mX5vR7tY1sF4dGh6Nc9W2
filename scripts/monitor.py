@@ -47,6 +47,8 @@ DEFAULT_REDIS_BASE = "https://jelab101-rimjhim.hf.space"
 _LOG_BUFFER_LOCK = threading.Lock()
 _LOG_BUFFER = collections.deque(maxlen=100)
 
+RUNNER_LOG_FILE = "/tmp/runner.log"
+
 def log(tag: str, msg: str):
     """Formatted timestamped console logger and real-time stream ring-buffer."""
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -55,6 +57,8 @@ def log(tag: str, msg: str):
     try:
         with _LOG_BUFFER_LOCK:
             _LOG_BUFFER.append(formatted)
+        with open(RUNNER_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(formatted + "\n")
     except Exception:
         pass
 
