@@ -141,15 +141,15 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
     }
     cur.execute("INSERT OR REPLACE INTO settings (id, data) VALUES (1, ?)", (json.dumps(settings_data),))
     
-    # Register active provider connections: OpenCode Free and API.airforce
+    # Register active provider connections: OpenCode Free
     cur.execute("""
         INSERT OR REPLACE INTO providerConnections (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
         VALUES ('conn-opencode-free', 'opencode', 'none', 'OpenCode Free', NULL, 1, 1, '{}', datetime('now'), datetime('now'))
     """)
-    cur.execute("""
-        INSERT OR REPLACE INTO providerConnections (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
-        VALUES ('conn-api-airforce', 'api-airforce', 'apikey', 'API.airforce', NULL, 1, 1, '{"apiKey":"free","testStatus":"active"}', datetime('now'), datetime('now'))
-    """)
+
+    # Clean up any legacy or stale airforce provider connections or models
+    cur.execute("DELETE FROM providerConnections WHERE id = 'conn-api-airforce' OR provider LIKE '%airforce%'")
+    cur.execute("DELETE FROM kv WHERE scope = 'customModels' AND key LIKE 'af|%'")
 
     api_key = os.environ.get("ROUTER_API_KEY", "sk-361ddf48ad95487f-l1vj9z-499b11a6")
     cur.execute("""
@@ -177,23 +177,6 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
         })
         cur.execute("INSERT OR REPLACE INTO kv (scope, key, value) VALUES ('customModels', ?, ?)", (kv_key, kv_val))
         print(f"  [+] Active Model: oc/{model_id}")
-
-    # Register API.airforce Free Models into 9Router
-    airforce_models = [
-        ("claude-3.7-sonnet", "Claude 3.7 Sonnet (Free)"),
-        ("kimi-k2.6", "Kimi K2.6 (Free)"),
-        ("gemini-2.5-flash", "Gemini 2.5 Flash (Free)")
-    ]
-    for af_id, af_name in airforce_models:
-        kv_key = f"af|{af_id}|llm"
-        kv_val = json.dumps({
-            "providerAlias": "af",
-            "id": af_id,
-            "type": "llm",
-            "name": af_name
-        })
-        cur.execute("INSERT OR REPLACE INTO kv (scope, key, value) VALUES ('customModels', ?, ?)", (kv_key, kv_val))
-        print(f"  [+] Active Model: af/{af_id}")
 
     conn.commit()
     conn.close()

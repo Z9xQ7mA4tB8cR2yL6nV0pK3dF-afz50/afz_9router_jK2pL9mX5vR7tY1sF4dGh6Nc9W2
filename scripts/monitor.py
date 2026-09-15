@@ -1038,18 +1038,14 @@ def cmd_run_daemon(args):
                                 if not m_owner and "/" in m_id:
                                     m_owner = m_id.split("/")[0]
                                 if not m_owner:
-                                    m_owner = "opencode-free" if m_id.lower().startswith("oc/") else ("api.airforce" if m_id.lower().startswith("af/") else "opencode-free")
+                                    m_owner = "opencode-free"
 
                                 prov_name = str(m_owner).strip().lower()
                                 if prov_name in ["oc", "opencode"]:
                                     prov_name = "opencode-free"
-                                elif prov_name in ["af", "airforce", "api-airforce", "api.airforce"]:
-                                    prov_name = "api.airforce"
 
                                 clean_id = m_id
                                 if clean_id.lower().startswith("oc/"):
-                                    clean_id = clean_id[3:]
-                                elif clean_id.lower().startswith("af/"):
                                     clean_id = clean_id[3:]
                                 elif clean_id.lower().startswith(f"{prov_name}/"):
                                     clean_id = clean_id[len(prov_name) + 1:]
