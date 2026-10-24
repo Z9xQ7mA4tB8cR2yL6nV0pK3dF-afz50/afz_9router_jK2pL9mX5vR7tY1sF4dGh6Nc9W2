@@ -225,8 +225,12 @@ jobs:
             9router -p "$ENGINE_PORT" -H 0.0.0.0 --tray -n >> /tmp/runner.log 2>&1 &
           fi
           
+          echo "[INFO] Installing gateway dependencies..."
+          cd scripts
+          npm install socks-proxy-agent http-proxy-agent
+          
           echo "[INFO] Starting Local Gateway on public port $PORT (Slot: $SLOT -> Internal: $ENGINE_PORT)..."
-          node scripts/gateway.js --port "$PORT" --target-port "$ENGINE_PORT" --slot "$SLOT" &
+          node gateway.js --port "$PORT" --target-port "$ENGINE_PORT" --slot "$SLOT" &
           
           echo "[INFO] Waiting for port $PORT to become active..."
           for i in {1..30}; do
