@@ -1721,9 +1721,38 @@ def cmd_run_daemon(args):
         models_count = 0
         status = "online"
         status_msg = ""
-        parsed_models = snap.get("models_list", [])
+parsed_models = snap.get("models_list", [])
         discovered_items = snap.get("discovered_models", [])
         discovered_providers = snap.get("providers", [])
+        
+        try:
+            req = urllib.request.Request(
+                models_url,
+                headers={"Authorization": f"Bearer {api_key}"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    rl_engine.on_success()
+                    data = resp.read().decode("utf-8")
+                    fresh_discovered = []
+                    fresh_ids = []
+                    provider_groups = {}
+
+                    try:
+                        parsed = json.loads(data)
+                        raw_items = []
+                        if isinstance(parsed, dict) and "data" in parsed:
+                            raw_items = parsed["data"]
+                        elif isinstance(parsed, list):
+                            raw_items = parsed
+
+                        for m in raw_items:
+                            if isinstance(m, dict) and m.get("id"):
+                                m_id = str(m.get("id")).strip()
+                                m_owner = m.get("owned_by") or m.get("provider") or ""
+                                if not m_owner and "/" in m_id:
+                                    m_owner = m_id.split("/")[0]
+                                
                                 if not m_owner:
                                     m_owner = "opencode-free"
 
