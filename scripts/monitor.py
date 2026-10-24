@@ -1291,8 +1291,11 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                             subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
                             time.sleep(2)
                             
-                            # Start NEW TEMPORARY tunnel (no token = trycloudflare.com)
-                            pid = start_temp_cf_tunnel(state.slot, redis_base)
+                            # Get WARP port from strategy engine (first port)
+                            warp_port = strategy_engine.warp_ports[0] if strategy_engine.warp_ports else 40000
+                            
+                            # Start NEW TEMPORARY tunnel (no token = trycloudflare.com), chained via WARP
+                            pid = start_temp_cf_tunnel(state.slot, redis_base, warp_port)
                             if pid:
                                 # Detect new IP via the temp tunnel
                                 time.sleep(3)
@@ -1493,18 +1496,27 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
                 if cloudflared_bin:
                     log("TUNNEL", f"Security Handshake SUCCESS! Launching Cloudflare Tunnel for {slot} (Port {port})...")
                     
+                    # Warp port for chaining (use first WARP port)
+                    warp_port = 40000
+                    
+                    # Set environment to route cloudflared through WARP SOCKS5
+                    env = os.environ.copy()
+                    env["ALL_PROXY"] = f"socks5://127.0.0.1:{warp_port}"
+                    env["HTTP_PROXY"] = f"socks5://127.0.0.1:{warp_port}"
+                    env["HTTPS_PROXY"] = f"socks5://127.0.0.1:{warp_port}"
+                    
                     # 1. Standard NAMED tunnel (persistent, from NODE_TUNNEL_MAP)
                     cmd = [cloudflared_bin, "tunnel", "--no-autoupdate", "run", "--token", token]
-                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                     
                     # 2. HTTP proxy mode on port 8080 for WARP→CF Tunnel chaining (NAMED tunnel)
                     cmd_proxy = [cloudflared_bin, "tunnel", "--no-autoupdate", "--url", "http://localhost:8080", "run", "--token", token]
-                    subprocess.Popen(cmd_proxy, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.Popen(cmd_proxy, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                     
-                    log("TUNNEL", f"Cloudflare Tunnel active (named tunnel + HTTP proxy on :8080)!")
+                    log("TUNNEL", f"Cloudflare Tunnel active (named tunnel + HTTP proxy on :8080, chained via WARP:{warp_port})!")
                     
                     # Mark CF Tunnel active in Redis for gateway.js strategy selection
-                    redis_setex_json(redis_base, f"9rt:tunnel:{slot}", 3600, {"active": True, "type": "named", "token": token})
+                    redis_setex_json(redis_base, f"9rt:tunnel:{slot}", 3600, {"active": True, "type": "named", "token": token, "warp_port": warp_port})
                 else:
                     log("TUNNEL_WARN", "cloudflared binary not found on PATH. Tunnel launch skipped.")
             else:
@@ -1516,9 +1528,10 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
         log("TUNNEL_ERR", f"Tunnel handshake error: {e}")
 
 
-def start_temp_cf_tunnel(slot: str, redis_base: str) -> str:
+def start_temp_cf_tunnel(slot: str, redis_base: str, warp_port: int = 40000) -> str:
     """
     Start a TEMPORARY Cloudflare Tunnel (trycloudflare.com) on port 8080.
+    Chained mode: cloudflared routes through WARP SOCKS5 proxy.
     No token needed - cloudflared generates random subdomain.
     Returns the process PID for later cleanup.
     """
@@ -1527,11 +1540,17 @@ def start_temp_cf_tunnel(slot: str, redis_base: str) -> str:
         log("TEMP_TUNNEL_ERR", "cloudflared binary not found")
         return None
     
-    log("TEMP_TUNNEL", f"Starting TEMPORARY CF Tunnel for {slot} on :8080...")
+    log("TEMP_TUNNEL", f"Starting TEMPORARY CF Tunnel for {slot} on :8080 (chained via WARP:{warp_port})...")
+    
+    # Set environment to route cloudflared through WARP SOCKS5
+    env = os.environ.copy()
+    env["ALL_PROXY"] = f"socks5://127.0.0.1:{warp_port}"
+    env["HTTP_PROXY"] = f"socks5://127.0.0.1:{warp_port}"
+    env["HTTPS_PROXY"] = f"socks5://127.0.0.1:{warp_port}"
     
     # cloudflared tunnel --url http://localhost:8080 (NO token = temporary)
     cmd = [cloudflared_bin, "tunnel", "--no-autoupdate", "--url", "http://localhost:8080"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     
     # Wait a moment for tunnel to establish and get the URL
     time.sleep(3)
@@ -1540,10 +1559,11 @@ def start_temp_cf_tunnel(slot: str, redis_base: str) -> str:
     redis_setex_json(redis_base, f"9rt:tunnel:{slot}", 3600, {
         "active": True, 
         "type": "temporary",
-        "pid": proc.pid
+        "pid": proc.pid,
+        "warp_port": warp_port
     })
     
-    log("TEMP_TUNNEL", f"Temporary CF Tunnel started (PID: {proc.pid})")
+    log("TEMP_TUNNEL", f"Temporary CF Tunnel started (PID: {proc.pid}, chained via WARP:{warp_port})")
     return proc.pid
 
 def stream_sync_worker(state: NodeSharedState, redis_base: str):
