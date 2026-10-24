@@ -138,6 +138,7 @@ class NodeSharedState:
         self.is_healthy = False
         self.active_models_count = 0
         self.warp_ip = "127.0.0.1"
+        self.warp_enabled = True  # Default: WARP ON
         self.models_list = []
         self.discovered_models = []
         self.providers = []
@@ -160,6 +161,10 @@ class NodeSharedState:
         with self.lock:
             self.warp_ip = ip
 
+    def set_warp_enabled(self, enabled: bool):
+        with self.lock:
+            self.warp_enabled = enabled
+
     def get_snapshot(self):
         with self.lock:
             return {
@@ -174,6 +179,7 @@ class NodeSharedState:
                 "is_healthy": self.is_healthy,
                 "models_count": self.active_models_count,
                 "warp_ip": self.warp_ip,
+                "warp_enabled": self.warp_enabled,
                 "models_list": list(self.models_list),
                 "discovered_models": list(self.discovered_models),
                 "providers": list(self.providers),
@@ -324,6 +330,216 @@ class RateLimitDecisionEngine:
         log("RL_ENGINE", "WARP IP rotated. Resetting all rate-limit counters for fresh IP address.")
         self.consecutive_rl_count = 0
         self.cumulative_wait_sec = 0.0
+
+
+# ==============================================================================
+# SMART EGRESS STRATEGY ENGINE (Free Multi-Strategy Router)
+# ==============================================================================
+
+class StrategyEngine:
+    """
+    Smart egress strategy selector with IP history tracking (48hr TTL).
+    Strategies: direct, warp (multi-instance), cf_tunnel, warp_ipv6
+    """
+    
+    def __init__(self, redis_base: str, slot: str, warp_enabled: bool = True):
+        self.redis_base = redis_base
+        self.slot = slot
+        self.warp_enabled = warp_enabled
+        self.history_key = f"9rt:egress:history:{slot}"
+        self.stats_key = f"9rt:egress:stats:{slot}"
+        
+        # Multi-WARP instances (different SOCKS ports)
+        self.warp_ports = [40000, 40001, 40002, 40003]
+        self.warp_modes = ["proxy", "warp", "warp+connector"]
+        self.current_warp_port_idx = 0
+        self.current_warp_mode_idx = 0
+        
+        # CF Tunnel tokens (from Worker)
+        self.cf_tunnel_tokens = []
+        self.current_tunnel_idx = 0
+    
+    def set_warp_enabled(self, enabled: bool):
+        self.warp_enabled = enabled
+    
+    def set_cf_tunnel_tokens(self, tokens: list):
+        self.cf_tunnel_tokens = tokens
+    
+    def get_available_strategies(self) -> list:
+        """Return list of available strategy names based on WARP state"""
+        strategies = ["direct"]  # Always available
+        
+        if self.warp_enabled:
+            strategies.extend(["warp", "warp_ipv6"])
+            if self.cf_tunnel_tokens:
+                strategies.append("cf_tunnel")
+        
+        return strategies
+    
+    def _detect_direct_ip(self) -> str:
+        """Detect direct VM IP (no proxy)"""
+        return detect_warp_egress_ip()
+    
+    def _detect_warp_ip(self) -> str:
+        """Detect IP via current WARP SOCKS5 proxy"""
+        port = self.warp_ports[self.current_warp_port_idx]
+        return detect_warp_egress_ip(proxy_addr=f"127.0.0.1:{port}")
+    
+    def _detect_warp_ipv6(self) -> str:
+        """Detect IPv6 via WARP"""
+        # For now use same detection, could be enhanced
+        return self._detect_warp_ip()
+    
+    def _detect_cf_tunnel_ip(self) -> str:
+        """Detect IP via CF Tunnel HTTP proxy"""
+        # Would use cloudflared tunnel HTTP proxy
+        return detect_warp_egress_ip()
+    
+    def _rotate_warp_instance(self):
+        """Switch to next WARP port"""
+        self.current_warp_port_idx = (self.current_warp_port_idx + 1) % len(self.warp_ports)
+        log("STRATEGY", f"Switched WARP to port {self.warp_ports[self.current_warp_port_idx]}")
+    
+    def _rotate_warp_mode(self):
+        """Cycle WARP mode (proxy -> warp -> warp+connector)"""
+        self.current_warp_mode_idx = (self.current_warp_mode_idx + 1) % len(self.warp_modes)
+        mode = self.warp_modes[self.current_warp_mode_idx]
+        log("STRATEGY", f"Switching WARP mode to {mode}")
+        self._set_warp_mode(mode)
+    
+    def _set_warp_mode(self, mode: str):
+        warp_bin = shutil.which("warp-cli")
+        if warp_bin:
+            subprocess.run([warp_bin, "--accept-tos", "mode", mode], capture_output=True)
+            subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True)
+            time.sleep(2)
+    
+    def _rotate_cf_tunnel(self):
+        """Switch to next CF Tunnel token"""
+        if self.cf_tunnel_tokens:
+            self.current_tunnel_idx = (self.current_tunnel_idx + 1) % len(self.cf_tunnel_tokens)
+            log("STRATEGY", f"Switched CF Tunnel to index {self.current_tunnel_idx}")
+    
+    def _get_strategy_score(self, name: str) -> float:
+        """Calculate strategy score based on success rate, latency, 429s, IP freshness"""
+        # Base score from priority
+        priority_scores = {"direct": 100, "warp": 80, "cf_tunnel": 70, "warp_ipv6": 60}
+        base = priority_scores.get(name, 50)
+        
+        # Get stats from Redis
+        stats = self._get_strategy_stats(name)
+        if stats:
+            # Success rate bonus (0-100)
+            success_rate = stats.get("success_rate", 100)
+            base += (success_rate / 100) * 30
+            
+            # Latency penalty (lower is better)
+            avg_latency = stats.get("avg_latency", 100)
+            base -= min(avg_latency / 20, 20)
+            
+            # 429 penalty
+            recent_429 = stats.get("recent_429", 0)
+            base -= recent_429 * 15
+        
+        # IP freshness bonus
+        last_ip = self._get_last_ip(name)
+        if last_ip and is_ip_fresh(self.redis_base, self.slot, name, last_ip):
+            base += 25
+        
+        return base
+    
+    def _get_strategy_stats(self, name: str) -> dict:
+        """Get strategy stats from Redis"""
+        try:
+            stats = redis_get(self.redis_base, self.stats_key)
+            if stats and isinstance(stats, dict):
+                return stats.get(name, {})
+        except:
+            pass
+        return {}
+    
+    def _get_last_ip(self, name: str) -> str:
+        """Get last used IP for strategy from history"""
+        try:
+            history = redis_zrangebyscore(self.redis_base, self.history_key, "0", str(int(time.time())))
+            for member in reversed(history):  # Most recent first
+                if member.startswith(f"{name}:"):
+                    return member.split(":", 1)[1]
+        except:
+            pass
+        return None
+    
+    def select_best_strategy(self) -> str:
+        """Select best available strategy"""
+        available = self.get_available_strategies()
+        
+        scored = []
+        for name in available:
+            score = self._get_strategy_score(name)
+            scored.append((name, score))
+        
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[0][0] if scored else "direct"
+    
+    def record_ip_use(self, strategy: str, ip: str):
+        """Record IP usage in history"""
+        record_ip_use(self.redis_base, self.slot, strategy, ip)
+    
+    def record_request_result(self, strategy: str, success: bool, latency: float = 0, is_429: bool = False):
+        """Record request result for strategy scoring"""
+        try:
+            stats = redis_get(self.redis_base, self.stats_key) or {}
+            if strategy not in stats:
+                stats[strategy] = {"total": 0, "success": 0, "latency_sum": 0, "recent_429": 0, "last_429_time": 0}
+            
+            s = stats[strategy]
+            s["total"] += 1
+            if success:
+                s["success"] += 1
+            s["latency_sum"] += latency
+            s["success_rate"] = (s["success"] / s["total"]) * 100
+            s["avg_latency"] = s["latency_sum"] / s["total"]
+            
+            if is_429:
+                s["recent_429"] += 1
+                s["last_429_time"] = time.time()
+            
+            # Decay 429 count over time (older than 5 min)
+            if s["last_429_time"] and (time.time() - s["last_429_time"] > 300):
+                s["recent_429"] = max(0, s["recent_429"] - 1)
+            
+            redis_setex_json(self.redis_base, self.stats_key, 3600, stats)
+        except Exception as e:
+            log("STRATEGY_STATS_ERR", f"Failed to record stats: {e}")
+    
+    def get_fresh_ip(self, strategy: str) -> str:
+        """Get fresh IP for strategy (with 48hr history check)"""
+        if strategy == "direct":
+            return get_fresh_ip_for_strategy(
+                self.redis_base, self.slot, "direct",
+                lambda: self._detect_direct_ip(),
+                lambda: None  # Direct IP rotates on new workflow run
+            )
+        elif strategy == "warp":
+            return get_fresh_ip_for_strategy(
+                self.redis_base, self.slot, "warp",
+                lambda: self._detect_warp_ip(),
+                lambda: self._rotate_warp_instance()
+            )
+        elif strategy == "warp_ipv6":
+            return get_fresh_ip_for_strategy(
+                self.redis_base, self.slot, "warp_ipv6",
+                lambda: self._detect_warp_ipv6(),
+                lambda: self._rotate_warp_instance()
+            )
+        elif strategy == "cf_tunnel":
+            return get_fresh_ip_for_strategy(
+                self.redis_base, self.slot, "cf_tunnel",
+                lambda: self._detect_cf_tunnel_ip(),
+                lambda: self._rotate_cf_tunnel()
+            )
+        return "unknown"
+
 
 def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "") -> bool:
     """
@@ -506,6 +722,197 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         )
         return False
 
+
+def execute_warp_enable(state: NodeSharedState, rl_engine: RateLimitDecisionEngine = None) -> str:
+    """
+    Enables WARP by connecting warp-cli in proxy mode.
+    Returns status message.
+    """
+    snap = state.get_snapshot()
+    models_cnt = snap["models_count"]
+
+    state.update_health(
+        is_healthy=False,
+        models_count=models_cnt,
+        status="rotating_ip",
+        status_msg="Enabling WARP (connecting Cloudflare WARP proxy)..."
+    )
+    log("WARP", "Enabling WARP...")
+
+    warp_bin = shutil.which("warp-cli")
+    if not warp_bin:
+        log("WARP_WARN", "warp-cli not found on PATH. Simulating WARP enable in non-WARP environment.")
+        time.sleep(2)
+        if rl_engine:
+            rl_engine.on_warp_rotated()
+        fresh_ip = detect_warp_egress_ip()
+        state.update_warp_ip(fresh_ip)
+        state.set_warp_enabled(True)
+        state.update_health(
+            is_healthy=True,
+            models_count=models_cnt,
+            status="online",
+            status_msg="WARP simulated enable complete (mock)"
+        )
+        return f"WARP enabled (mock), egress IP: {fresh_ip}"
+
+    def run_cmd(cmd_args, input_text=None, timeout=30):
+        cmd_str = " ".join(cmd_args)
+        log("CMD_EXEC", f"Running: {cmd_str}")
+        try:
+            res = subprocess.run(
+                cmd_args,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            out = res.stdout.strip()
+            err = res.stderr.strip()
+            if out:
+                for line in out.splitlines():
+                    log("CMD_OUT", f"  {line}")
+            if err:
+                for line in err.splitlines():
+                    log("CMD_ERR", f"  {line}")
+            log("CMD_STATUS", f"Command completed with exit code: {res.returncode}")
+            return res
+        except Exception as exc:
+            log("CMD_FAIL", f"Command execution exception: {exc}")
+            return None
+
+    try:
+        # Connect WARP in proxy mode
+        run_cmd([warp_bin, "--accept-tos", "disconnect"])
+        run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
+        time.sleep(2)
+        run_cmd([warp_bin, "--accept-tos", "registration", "new"])
+        run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
+        run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
+        run_cmd([warp_bin, "--accept-tos", "connect"])
+        time.sleep(3)
+
+        # Verify WARP is working
+        fresh_ip = detect_warp_egress_ip()
+        state.update_warp_ip(fresh_ip)
+        state.set_warp_enabled(True)
+        if rl_engine:
+            rl_engine.on_warp_rotated()
+        state.update_health(
+            is_healthy=True,
+            models_count=models_cnt,
+            status="online",
+            status_msg=f"WARP enabled successfully, egress IP: {fresh_ip}"
+        )
+        return f"WARP enabled, egress IP: {fresh_ip}"
+
+    except Exception as e:
+        log("WARP_ERR", f"WARP enable encountered critical exception: {e}")
+        state.update_health(
+            is_healthy=False,
+            models_count=models_cnt,
+            status="error",
+            status_msg=f"WARP enable failed: {e}"
+        )
+        return f"WARP enable failed: {e}"
+
+
+def execute_warp_disable(state: NodeSharedState) -> str:
+    """
+    Disables WARP by disconnecting warp-cli.
+    Returns status message.
+    """
+    snap = state.get_snapshot()
+    models_cnt = snap["models_count"]
+
+    state.update_health(
+        is_healthy=False,
+        models_count=models_cnt,
+        status="rotating_ip",
+        status_msg="Disabling WARP (switching to direct VM egress)..."
+    )
+    log("WARP", "Disabling WARP...")
+
+    warp_bin = shutil.which("warp-cli")
+    if not warp_bin:
+        log("WARP_WARN", "warp-cli not found on PATH. Simulating WARP disable.")
+        time.sleep(1)
+        # Get direct VM IP
+        fresh_ip = detect_warp_egress_ip()
+        state.update_warp_ip(fresh_ip)
+        state.set_warp_enabled(False)
+        state.update_health(
+            is_healthy=True,
+            models_count=models_cnt,
+            status="online",
+            status_msg=f"WARP disabled (mock), using direct VM IP: {fresh_ip}"
+        )
+        return f"WARP disabled (mock), direct VM IP: {fresh_ip}"
+
+    def run_cmd(cmd_args, input_text=None, timeout=30):
+        cmd_str = " ".join(cmd_args)
+        log("CMD_EXEC", f"Running: {cmd_str}")
+        try:
+            res = subprocess.run(
+                cmd_args,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            out = res.stdout.strip()
+            err = res.stderr.strip()
+            if out:
+                for line in out.splitlines():
+                    log("CMD_OUT", f"  {line}")
+            if err:
+                for line in err.splitlines():
+                    log("CMD_ERR", f"  {line}")
+            log("CMD_STATUS", f"Command completed with exit code: {res.returncode}")
+            return res
+        except Exception as exc:
+            log("CMD_FAIL", f"Command execution exception: {exc}")
+            return None
+
+    try:
+        # Disconnect WARP
+        run_cmd([warp_bin, "--accept-tos", "disconnect"])
+        time.sleep(2)
+
+        # Get direct VM IP (without WARP proxy)
+        fresh_ip = "127.0.0.1"
+        try:
+            curl_bin = shutil.which("curl")
+            if curl_bin:
+                res = subprocess.run([curl_bin, "-s", "--max-time", "5", "https://api.ipify.org"], capture_output=True, text=True, timeout=6)
+                if res.returncode == 0:
+                    ip = res.stdout.strip()
+                    if ip and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
+                        fresh_ip = ip
+        except Exception:
+            pass
+
+        state.update_warp_ip(fresh_ip)
+        state.set_warp_enabled(False)
+        state.update_health(
+            is_healthy=True,
+            models_count=models_cnt,
+            status="online",
+            status_msg=f"WARP disabled, using direct VM IP: {fresh_ip}"
+        )
+        return f"WARP disabled, direct VM IP: {fresh_ip}"
+
+    except Exception as e:
+        log("WARP_ERR", f"WARP disable encountered critical exception: {e}")
+        state.update_health(
+            is_healthy=False,
+            models_count=models_cnt,
+            status="error",
+            status_msg=f"WARP disable failed: {e}"
+        )
+        return f"WARP disable failed: {e}"
+
+
 # ----------------- Redis HTTP REST Client -----------------
 
 def redis_http_call(url: str, timeout: int = 10):
@@ -582,6 +989,117 @@ def redis_del(redis_base: str, key: str):
     url = f"{redis_base.rstrip('/')}/DEL/{urllib.parse.quote(key)}"
     return redis_http_call(url)
 
+# ----------------- Redis ZSET Functions for IP History (48hr TTL from last use) -----------------
+
+def redis_zadd(redis_base: str, key: str, member_score_dict: dict):
+    """Add members with scores to sorted set. member_score_dict = {member: score}"""
+    try:
+        # Redis REST API: ZADD key score member [score member ...]
+        # We'll send as JSON body to avoid URL length issues
+        pairs = []
+        for member, score in member_score_dict.items():
+            pairs.append(str(score))
+            pairs.append(urllib.parse.quote(str(member), safe=''))
+        # Use ZADD with multiple score-member pairs
+        data = "&".join([f"score_member[]={urllib.parse.quote(p)}" for p in pairs])
+        url = f"{redis_base.rstrip('/')}/ZADD/{urllib.parse.quote(key)}"
+        req = urllib.request.Request(
+            url,
+            data=data.encode(),
+            headers={"User-Agent": "9Router-Monitor/2.0", "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        log("REDIS_ZADD_ERR", f"ZADD {key}: {e}")
+        return None
+
+def redis_zscore(redis_base: str, key: str, member: str):
+    """Get score of member in sorted set"""
+    try:
+        url = f"{redis_base.rstrip('/')}/ZSCORE/{urllib.parse.quote(key)}/{urllib.parse.quote(member)}"
+        res = redis_http_call(url)
+        if isinstance(res, dict):
+            val = res.get("ZSCORE")
+            if val is not None:
+                return float(val)
+        return None
+    except Exception as e:
+        log("REDIS_ZSCORE_ERR", f"ZSCORE {key} {member}: {e}")
+        return None
+
+def redis_zremrangebyscore(redis_base: str, key: str, min_score: str, max_score: str):
+    """Remove members with scores in range [min, max]"""
+    try:
+        url = f"{redis_base.rstrip('/')}/ZREMRANGEBYSCORE/{urllib.parse.quote(key)}/{urllib.parse.quote(min_score)}/{urllib.parse.quote(max_score)}"
+        res = redis_http_call(url)
+        return res
+    except Exception as e:
+        log("REDIS_ZREMRANGEBYSCORE_ERR", f"ZREMRANGEBYSCORE {key}: {e}")
+        return None
+
+def redis_zrangebyscore(redis_base: str, key: str, min_score: str, max_score: str, limit: int = 100):
+    """Get members with scores in range"""
+    try:
+        url = f"{redis_base.rstrip('/')}/ZRANGEBYSCORE/{urllib.parse.quote(key)}/{urllib.parse.quote(min_score)}/{urllib.parse.quote(max_score)}?limit={limit}"
+        res = redis_http_call(url)
+        if isinstance(res, dict):
+            return res.get("ZRANGEBYSCORE", [])
+        return []
+    except Exception as e:
+        log("REDIS_ZRANGEBYSCORE_ERR", f"ZRANGEBYSCORE {key}: {e}")
+        return []
+
+# IP History Functions (48hr TTL from last use)
+IP_HISTORY_TTL_HOURS = 48
+
+def record_ip_use(redis_base: str, slot: str, strategy: str, ip: str):
+    """Record IP usage with timestamp (last used time)"""
+    key = f"9rt:egress:history:{slot}"
+    member = f"{strategy}:{ip}"
+    now = int(time.time())
+    try:
+        redis_zadd(redis_base, key, {member: now})
+        # Auto cleanup: remove entries older than 48hr
+        cutoff = now - (IP_HISTORY_TTL_HOURS * 3600)
+        redis_zremrangebyscore(redis_base, key, "-inf", str(cutoff))
+        log("IP_HISTORY", f"Recorded {member} for {slot} at {now}")
+    except Exception as e:
+        log("IP_HISTORY_ERR", f"Failed to record IP use: {e}")
+
+def is_ip_fresh(redis_base: str, slot: str, strategy: str, ip: str) -> bool:
+    """Check if IP not used in last 48hr for this strategy"""
+    key = f"9rt:egress:history:{slot}"
+    member = f"{strategy}:{ip}"
+    cutoff = int(time.time()) - (IP_HISTORY_TTL_HOURS * 3600)
+    score = redis_zscore(redis_base, key, member)
+    if score is None:
+        return True  # Never used
+    return score < cutoff  # True if last used before 48hr ago
+
+def get_fresh_ip_for_strategy(redis_base: str, slot: str, strategy: str, ip_detect_func, rotate_func, max_attempts: int = 5) -> str:
+    """Rotate until fresh IP found (max attempts)"""
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            log("IP_ROTATE", f"Attempt {attempt + 1}/{max_attempts} for {strategy}...")
+            rotate_func()
+            time.sleep(3)
+        
+        new_ip = ip_detect_func()
+        if is_ip_fresh(redis_base, slot, strategy, new_ip):
+            record_ip_use(redis_base, slot, strategy, new_ip)
+            log("IP_ROTATE", f"Fresh IP {new_ip} for {strategy} (attempt {attempt + 1})")
+            return new_ip
+        else:
+            log("IP_ROTATE", f"IP {new_ip} used in last 48hr for {strategy}, re-rotating...")
+    
+    # Fallback: accept anyway, but record
+    final_ip = ip_detect_func()
+    record_ip_use(redis_base, slot, strategy, final_ip)
+    log("IP_ROTATE_WARN", f"Max attempts reached, accepting {final_ip} for {strategy}")
+    return final_ip
+
 # ----------------- Operational Commands -----------------
 
 def cmd_check_lock(args):
@@ -632,16 +1150,50 @@ def cmd_check_lock(args):
 
 # ----------------- Thread 1: Heartbeat Daemon -----------------
 
-def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: RateLimitDecisionEngine = None):
+def start_multi_warp_instances(state: NodeSharedState, strategy_engine: StrategyEngine):
+    """Start multiple WARP instances on different SOCKS ports"""
+    warp_bin = shutil.which("warp-cli")
+    if not warp_bin:
+        log("WARP_WARN", "warp-cli not found, cannot start multi-WARP")
+        return
+    
+    for i, port in enumerate(strategy_engine.warp_ports):
+        log("WARP_INIT", f"Starting WARP instance {i+1} on port {port} (mode: {strategy_engine.warp_modes[strategy_engine.current_warp_mode_idx]})")
+        
+        # Each instance needs its own registration
+        subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True)
+        subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], input="y\n", capture_output=True, text=True)
+        time.sleep(1)
+        subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True)
+        subprocess.run([warp_bin, "--accept-tos", "mode", strategy_engine.warp_modes[strategy_engine.current_warp_mode_idx]], capture_output=True)
+        subprocess.run([warp_bin, "--accept-tos", "proxy", "port", str(port)], capture_output=True)
+        subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True)
+        time.sleep(2)
+        
+        # Verify this instance
+        ip = detect_warp_egress_ip(proxy_addr=f"127.0.0.1:{port}")
+        log("WARP_INIT", f"  Instance {i+1} (port {port}) egress IP: {ip}")
+
+def stop_all_warp_instances():
+    """Stop all WARP instances"""
+    warp_bin = shutil.which("warp-cli")
+    if warp_bin:
+        subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True)
+        # Kill any remaining warp-cli processes
+        subprocess.run(["pkill", "-f", "warp-cli"], capture_output=True)
+    log("WARP", "All WARP instances stopped")
+
+def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: RateLimitDecisionEngine = None, strategy_engine: StrategyEngine = None):
     """
     Dedicated Command Consumer Daemon Thread:
     - Runs continuously on a fast 3-second cycle.
     - Observes 9rt:cmd:{slot} in Redis without delaying or conflicting with the Heartbeat daemon.
-    - Consumes command immediately, executes action (rotate_ip / set_combo), writes acknowledgment to 9rt:ack:{slot}.
+    - Consumes command immediately, executes action (rotate_ip / set_combo / warp_on / warp_off), writes acknowledgment to 9rt:ack:{slot}.
     - Deletes 9rt:cmd:{slot} upon completion (no TTL dependency).
     """
     cmd_key = f"9rt:cmd:{state.slot}"
     ack_key = f"9rt:ack:{state.slot}"
+    warp_state_key = f"9rt:warp:{state.slot}"
     log("CMD_THREAD", f"Dedicated Command Consumer Thread active for {state.slot} (Interval: 3s).")
 
     while True:
@@ -667,13 +1219,95 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                 try:
                     if action == "rotate_ip":
                         log("CMD_CONSUMER", "Executing WARP IP rotation by command...")
-                        if rl_engine:
+                        if strategy_engine:
+                            fresh_ip = strategy_engine.get_fresh_ip("warp")
+                            state.update_warp_ip(fresh_ip)
+                            strategy_engine.record_ip_use("warp", fresh_ip)
+                            ack_payload["new_ip"] = fresh_ip
+                            ack_payload["message"] = f"WARP IP rotated to {fresh_ip} (fresh, not used in 48hr)."
+                        elif rl_engine:
                             execute_warp_rotation(state, rl_engine, rule="USER_COMMAND")
-                        fresh_ip = detect_warp_egress_ip()
+                            fresh_ip = detect_warp_egress_ip()
+                            state.update_warp_ip(fresh_ip)
+                            ack_payload["new_ip"] = fresh_ip
+                            ack_payload["message"] = f"WARP IP rotated to {fresh_ip}."
+                        log("CMD_CONSUMER", f"WARP IP rotated to: {ack_payload.get('new_ip')}")
+
+                    elif action == "warp_on":
+                        log("CMD_CONSUMER", "Enabling WARP (starting multi-instance)...")
+                        state.set_warp_enabled(True)
+                        if strategy_engine:
+                            strategy_engine.set_warp_enabled(True)
+                            start_multi_warp_instances(state, strategy_engine)
+                            fresh_ip = strategy_engine.get_fresh_ip("warp")
+                            state.update_warp_ip(fresh_ip)
+                            strategy_engine.record_ip_use("warp", fresh_ip)
+                            ack_payload["message"] = f"WARP ON - {len(strategy_engine.warp_ports)} instances started, fresh IP: {fresh_ip}"
+                        else:
+                            result = execute_warp_enable(state, rl_engine)
+                            ack_payload["message"] = result
+                        ack_payload["warp_enabled"] = True
+                        log("CMD_CONSUMER", f"WARP enabled")
+
+                    elif action == "warp_off":
+                        log("CMD_CONSUMER", "Disabling WARP (stopping all instances, using direct VM IP)...")
+                        state.set_warp_enabled(False)
+                        if strategy_engine:
+                            strategy_engine.set_warp_enabled(False)
+                        stop_all_warp_instances()
+                        fresh_ip = detect_warp_egress_ip()  # Direct IP
                         state.update_warp_ip(fresh_ip)
-                        ack_payload["new_ip"] = fresh_ip
-                        ack_payload["message"] = f"WARP IP rotated to {fresh_ip}."
-                        log("CMD_CONSUMER", f"WARP IP rotated to: {fresh_ip}")
+                        state.update_health(
+                            is_healthy=True,
+                            models_count=snap["models_count"],
+                            status="online",
+                            status_msg=f"WARP OFF - using direct VM IP: {fresh_ip}"
+                        )
+                        strategy_engine.record_ip_use("direct", fresh_ip) if strategy_engine else None
+                        ack_payload["warp_enabled"] = False
+                        ack_payload["message"] = f"WARP OFF - using direct VM IP: {fresh_ip}"
+                        log("CMD_CONSUMER", f"WARP disabled, direct IP: {fresh_ip}")
+
+                    elif action == "rotate_warp_mode":
+                        if strategy_engine:
+                            strategy_engine._rotate_warp_mode()
+                            start_multi_warp_instances(state, strategy_engine)
+                            fresh_ip = strategy_engine.get_fresh_ip("warp")
+                            state.update_warp_ip(fresh_ip)
+                            ack_payload["message"] = f"WARP mode cycled, fresh IP: {fresh_ip}"
+                            log("CMD_CONSUMER", f"WARP mode cycled to {strategy_engine.warp_modes[strategy_engine.current_warp_mode_idx]}")
+
+                    elif action == "refresh_strategy":
+                        if strategy_engine:
+                            best = strategy_engine.select_best_strategy()
+                            ack_payload["message"] = f"Best strategy: {best}"
+                            ack_payload["best_strategy"] = best
+                            log("CMD_CONSUMER", f"Strategy refresh: {best}")
+
+                    elif action == "rotate_cf_tunnel":
+                        log("CMD_CONSUMER", "Rotating TEMPORARY CF Tunnel for fresh IP (destroy + recreate)...")
+                        if strategy_engine:
+                            # Kill ALL existing cloudflared processes
+                            subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
+                            time.sleep(2)
+                            
+                            # Start NEW TEMPORARY tunnel (no token = trycloudflare.com)
+                            pid = start_temp_cf_tunnel(state.slot, redis_base)
+                            if pid:
+                                # Detect new IP via the temp tunnel
+                                time.sleep(3)
+                                fresh_ip = detect_warp_egress_ip()
+                                state.update_warp_ip(fresh_ip)
+                                strategy_engine.record_ip_use("warp_cf_tunnel", fresh_ip)
+                                ack_payload["message"] = f"TEMP CF Tunnel rotated (PID: {pid}), fresh IP: {fresh_ip}"
+                                ack_payload["new_ip"] = fresh_ip
+                                log("CMD_CONSUMER", f"TEMP CF Tunnel rotated to {fresh_ip}")
+                            else:
+                                ack_payload["status"] = "error"
+                                ack_payload["message"] = "Failed to start temporary CF tunnel"
+                        else:
+                            ack_payload["status"] = "error"
+                            ack_payload["message"] = "Strategy engine not available"
 
                     else:
                         ack_payload["status"] = "ignored"
@@ -696,12 +1330,13 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
         time.sleep(3)
 
 
-def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_key: str, rl_engine: RateLimitDecisionEngine = None):
+def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_key: str, rl_engine: RateLimitDecisionEngine = None, strategy_engine: StrategyEngine = None):
     """
     Dedicated Background Heartbeat Thread:
     - Runs strictly every 15 seconds.
     - Renews 9rt:lock and 9rt:hb leases.
     - Publishes 100% complete telemetry pulse to Redis.
+    - Records active egress IP in history (48hr TTL from last use).
     """
     pulse_count = 0
     log("HB_THREAD", f"Heartbeat & Lock Daemon started for {state.slot} on dedicated thread.")
@@ -734,13 +1369,28 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             log("SELF_HEAL", f"Lock key was missing. Re-claiming lock lease for {snap['run_id']}...")
             redis_setex_str(redis_base, lock_key, 60, snap["run_id"])
 
-        # 2. Egress WARP IP Check (Every 60s / 4 pulses)
+        # 2. Egress IP Check & History Recording (Every 60s / 4 pulses)
         if pulse_count == 1 or pulse_count % 4 == 0:
             try:
-                active_ip = detect_warp_egress_ip()
+                # Determine current active strategy from warp_enabled state
+                warp_enabled = snap.get("warp_enabled", True)
+                
+                if warp_enabled and strategy_engine:
+                    # WARP is ON - use current WARP instance IP
+                    active_ip = strategy_engine._detect_warp_ip()
+                    strategy_engine.record_ip_use("warp", active_ip)
+                elif not warp_enabled:
+                    # WARP is OFF - use direct VM IP
+                    active_ip = detect_warp_egress_ip()
+                    if strategy_engine:
+                        strategy_engine.record_ip_use("direct", active_ip)
+                else:
+                    # Fallback
+                    active_ip = detect_warp_egress_ip()
+                
                 state.update_warp_ip(active_ip)
-            except Exception:
-                pass
+            except Exception as e:
+                log("HB_WARN", f"IP check failed: {e}")
 
         # 3. Renew All-in-One Heartbeat (TTL 60s)
         snap = state.get_snapshot()
@@ -767,6 +1417,11 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             }
         ]
 
+        # Include current strategy in heartbeat for UI
+        current_strategy = "direct"
+        if snap.get("warp_enabled", True):
+            current_strategy = "warp"
+        
         hb_payload = {
             "slot": snap["slot"],
             "name": snap["name"],
@@ -779,6 +1434,8 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "status": snap["status"],
             "status_msg": snap["status_msg"],
             "warp_ip": snap["warp_ip"],
+            "warp_enabled": snap.get("warp_enabled", True),
+            "egress_strategy": current_strategy,
             "provider": primary_provider,
             "providers": active_providers,
             "models": compact_models,
@@ -788,12 +1445,10 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
         if res is not None and isinstance(res, dict) and res.get("SETEX") == [True, "OK"]:
             if pulse_count == 1 or pulse_count % 10 == 0:
                 log("HB_SYNC", f"Heartbeat verified in Redis ({hb_key})")
-        else:
-            log("HB_WARN", f"Redis SETEX returned non-OK status: {res} at {hb_key}")
 
         # 5. Rich Formatted Console Output
         badge = "🟢 ONLINE" if snap["is_healthy"] else f"🟡 {snap['status'].upper()}"
-        log("PULSE", f"#{pulse_count:04d} | {snap['slot']} ({snap['name']}) | Uptime: {uptime}s | {badge} | Egress: {snap['warp_ip']} | Msg: {snap['status_msg']}")
+        log("PULSE", f"#{pulse_count:04d} | {snap['slot']} ({snap['name']}) | Uptime: {uptime}s | {badge} | Egress: {snap['warp_ip']} | Strategy: {current_strategy} | Msg: {snap['status_msg']}")
 
         # Sleep precisely 15 seconds in 1-second intervals for quick termination
         for _ in range(15):
@@ -837,9 +1492,19 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
                 cloudflared_bin = shutil.which("cloudflared")
                 if cloudflared_bin:
                     log("TUNNEL", f"Security Handshake SUCCESS! Launching Cloudflare Tunnel for {slot} (Port {port})...")
+                    
+                    # 1. Standard NAMED tunnel (persistent, from NODE_TUNNEL_MAP)
                     cmd = [cloudflared_bin, "tunnel", "--no-autoupdate", "run", "--token", token]
                     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    log("TUNNEL", f"Cloudflare Tunnel active and connected in background!")
+                    
+                    # 2. HTTP proxy mode on port 8080 for WARP→CF Tunnel chaining (NAMED tunnel)
+                    cmd_proxy = [cloudflared_bin, "tunnel", "--no-autoupdate", "--url", "http://localhost:8080", "run", "--token", token]
+                    subprocess.Popen(cmd_proxy, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    log("TUNNEL", f"Cloudflare Tunnel active (named tunnel + HTTP proxy on :8080)!")
+                    
+                    # Mark CF Tunnel active in Redis for gateway.js strategy selection
+                    redis_setex_json(redis_base, f"9rt:tunnel:{slot}", 3600, {"active": True, "type": "named", "token": token})
                 else:
                     log("TUNNEL_WARN", "cloudflared binary not found on PATH. Tunnel launch skipped.")
             else:
@@ -849,6 +1514,37 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
         log("TUNNEL_ERR", f"Tunnel handshake failed ({e.code}): {err_msg}")
     except Exception as e:
         log("TUNNEL_ERR", f"Tunnel handshake error: {e}")
+
+
+def start_temp_cf_tunnel(slot: str, redis_base: str) -> str:
+    """
+    Start a TEMPORARY Cloudflare Tunnel (trycloudflare.com) on port 8080.
+    No token needed - cloudflared generates random subdomain.
+    Returns the process PID for later cleanup.
+    """
+    cloudflared_bin = shutil.which("cloudflared")
+    if not cloudflared_bin:
+        log("TEMP_TUNNEL_ERR", "cloudflared binary not found")
+        return None
+    
+    log("TEMP_TUNNEL", f"Starting TEMPORARY CF Tunnel for {slot} on :8080...")
+    
+    # cloudflared tunnel --url http://localhost:8080 (NO token = temporary)
+    cmd = [cloudflared_bin, "tunnel", "--no-autoupdate", "--url", "http://localhost:8080"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    # Wait a moment for tunnel to establish and get the URL
+    time.sleep(3)
+    
+    # Mark temp tunnel active in Redis
+    redis_setex_json(redis_base, f"9rt:tunnel:{slot}", 3600, {
+        "active": True, 
+        "type": "temporary",
+        "pid": proc.pid
+    })
+    
+    log("TEMP_TUNNEL", f"Temporary CF Tunnel started (PID: {proc.pid})")
+    return proc.pid
 
 def stream_sync_worker(state: NodeSharedState, redis_base: str):
     """
@@ -946,10 +1642,23 @@ def cmd_run_daemon(args):
     # Initialize Rate Limit & WARP Decision Matrix Engine
     rl_engine = RateLimitDecisionEngine(boot_timestamp)
 
-    # Spawn Thread 1: Dedicated Heartbeat Worker
+    # Initialize Smart Egress Strategy Engine
+    strategy_engine = StrategyEngine(redis_base, slot, warp_enabled=True)
+    
+    # Get CF Tunnel tokens from Worker if available
+    # (Worker stores them in NODE_TUNNEL_MAP or via /api/node/:slot/tunnel)
+    # For now, we'll fetch from Redis if available
+    try:
+        tunnel_data = redis_get(redis_base, f"9rt:tunnel:{slot}")
+        if tunnel_data and isinstance(tunnel_data, dict) and "token" in tunnel_data:
+            strategy_engine.set_cf_tunnel_tokens([tunnel_data["token"]])
+    except:
+        pass
+
+    # Spawn Thread 1: Dedicated Heartbeat Worker (with StrategyEngine)
     hb_thread = threading.Thread(
         target=heartbeat_worker,
-        args=(state, redis_base, lock_key, hb_key, rl_engine),
+        args=(state, redis_base, lock_key, hb_key, rl_engine, strategy_engine),
         daemon=True,
         name="HeartbeatDaemon"
     )
@@ -959,12 +1668,16 @@ def cmd_run_daemon(args):
     # Spawn Thread 2: Dedicated Command Consumer Worker (Fast 3s polling, zero delay)
     cmd_thread = threading.Thread(
         target=command_consumer_worker,
-        args=(state, redis_base, rl_engine),
+        args=(state, redis_base, rl_engine, strategy_engine),
         daemon=True,
         name="CommandConsumerDaemon"
     )
     cmd_thread.start()
     log("INIT", "Spawned independent CommandConsumerDaemon thread.")
+
+    # Start multi-WARP instances if WARP is enabled
+    if state.get_snapshot().get("warp_enabled", True):
+        start_multi_warp_instances(state, strategy_engine)
 
     # Direct True SSE is served via gateway.js (/logs?stream=true).
     # Legacy Redis stream key (9rt:stream) is removed to avoid redundant write operations.
@@ -983,6 +1696,8 @@ def cmd_run_daemon(args):
     def handle_signal(sig, frame):
         log("SIGNAL", f"Received termination signal ({sig}). Cleaning up...")
         state.stop()
+        # Stop all WARP instances
+        stop_all_warp_instances()
         # Clean delete of lock, hb, and stream so slot becomes instantly free
         redis_del(redis_base, lock_key)
         redis_del(redis_base, hb_key)
@@ -1009,34 +1724,6 @@ def cmd_run_daemon(args):
         parsed_models = snap.get("models_list", [])
         discovered_items = snap.get("discovered_models", [])
         discovered_providers = snap.get("providers", [])
-
-        try:
-            req = urllib.request.Request(
-                models_url,
-                headers={"Authorization": f"Bearer {api_key}"}
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                if resp.status == 200:
-                    rl_engine.on_success()
-                    data = resp.read().decode("utf-8")
-                    fresh_discovered = []
-                    fresh_ids = []
-                    provider_groups = {}
-
-                    try:
-                        parsed = json.loads(data)
-                        raw_items = []
-                        if isinstance(parsed, dict) and "data" in parsed:
-                            raw_items = parsed["data"]
-                        elif isinstance(parsed, list):
-                            raw_items = parsed
-
-                        for m in raw_items:
-                            if isinstance(m, dict) and m.get("id"):
-                                m_id = str(m.get("id")).strip()
-                                m_owner = m.get("owned_by") or m.get("provider") or ""
-                                if not m_owner and "/" in m_id:
-                                    m_owner = m_id.split("/")[0]
                                 if not m_owner:
                                     m_owner = "opencode-free"
 
