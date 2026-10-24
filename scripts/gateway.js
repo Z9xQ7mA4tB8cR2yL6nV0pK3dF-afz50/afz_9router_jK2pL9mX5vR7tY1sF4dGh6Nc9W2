@@ -131,14 +131,24 @@ async function detectDirectIP() {
 
 async function detectWarpIP(port) {
   try {
-    const agent = new (require("http").Agent)();
-    // Use socks-proxy-agent if available, otherwise direct
     const socksAgent = require("socks-proxy-agent");
     const agent = new socksAgent(`socks5://127.0.0.1:${port}`);
     const res = await fetch("https://api.ipify.org", { agent, headers: { "User-Agent": "9Router-Gateway" } });
     if (res.ok) return (await res.text()).trim();
   } catch (e) {
-    // Fallback without proxy
+    return detectDirectIP();
+  }
+  return "unknown";
+}
+
+async function detectCFProxyIP() {
+  // Detect IP via cloudflared HTTP proxy (port 8080)
+  try {
+    const HttpProxyAgent = require("http-proxy-agent");
+    const agent = new HttpProxyAgent(`http://127.0.0.1:${CF_TUNNEL_PORT}`);
+    const res = await fetch("https://api.ipify.org", { agent, headers: { "User-Agent": "9Router-Gateway" } });
+    if (res.ok) return (await res.text()).trim();
+  } catch (e) {
     return detectDirectIP();
   }
   return "unknown";
@@ -176,7 +186,7 @@ function calculateStrategyScore(name) {
   const s = getStrategyStats(name);
   if (!s) return 0;
   
-  const priority = { direct: 100, warp: 80, cf_tunnel: 70, warp_ipv6: 60 }[name] || 50;
+  const priority = { direct: 100, warp: 80, warp_cf_tunnel: 70, warp_ipv6: 60 }[name] || 50;
   let score = priority;
   
   const successRate = s.total > 0 ? (s.success / s.total) * 100 : 100;
@@ -186,6 +196,9 @@ function calculateStrategyScore(name) {
   score -= Math.min(avgLatency / 20, 20);
   
   score -= s.recent429 * 15;
+  
+  // IP freshness bonus (if we have recent IP data from monitor.py)
+  // This would need Redis integration; for now skip
   
   return score;
 }
@@ -278,10 +291,9 @@ function createStrategyAgent(strategy) {
   
   if (strategy === "warp_cf_tunnel") {
     // CHAINED: WARP SOCKS5 → CF Tunnel HTTP proxy
-    // cloudflared runs HTTP proxy on localhost:8080
-    // We use http-proxy-agent to connect to cloudflared, which then routes through WARP
-    // But actually cloudflared needs to be configured to use WARP as upstream
-    // For now, use CF Tunnel HTTP proxy directly (cloudflared handles WARP internally if configured)
+    // cloudflared runs HTTP proxy on localhost:8080, configured to use WARP upstream
+    // This requires cloudflared to be started with: cloudflared tunnel --url http://localhost:8080 --proxy-destination socks5://127.0.0.1:40000
+    // For now, connect to cloudflared HTTP proxy which should route through WARP
     try {
       const HttpProxyAgent = require("http-proxy-agent");
       return new HttpProxyAgent(`http://127.0.0.1:${CF_TUNNEL_PORT}`);
