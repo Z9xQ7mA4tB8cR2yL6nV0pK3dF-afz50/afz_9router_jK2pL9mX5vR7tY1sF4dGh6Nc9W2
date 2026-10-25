@@ -146,7 +146,7 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
     """, (api_key,))
     print(f"[SEED] Generated unique API key for this node: {api_key[:12]}...")
     # Write API key to file for gateway consumption
-    key_file = os.path.join(os.path.dirname(db_path), "api_key.txt")
+    key_file = os.path.join(os.path.dirname(target_db), "api_key.txt")
     with open(key_file, "w") as f:
         f.write(api_key)
     print(f"[SEED] API key written to {key_file}")
