@@ -1110,6 +1110,11 @@ def cmd_run_daemon(args):
     log("INIT", f"Claiming initial lock lease at {lock_key}...")
     redis_setex_str(redis_base, lock_key, 60, run_id)
 
+    # Clear any stale pending commands from previous runs
+    cmd_key = f"9rt:cmd:{slot}"
+    redis_del(redis_base, cmd_key)
+    log("INIT", f"Cleared stale command queue at {cmd_key}")
+
     initial_hb = {
         "slot": slot,
         "name": node_name,
