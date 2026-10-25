@@ -111,42 +111,31 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_HANDSHAKE_TOKEN: ${{ secrets.WORKER_HANDSHAKE_TOKEN }}
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
-          RUN_ID: ${{ steps.node_meta.outputs.run_id }}
         run: |
           echo "[STEP 5] Fetching runner config from Worker..."
-          RESPONSE=$(curl -s -X POST \
+          RESPONSE=$(curl -s -X GET \
             -H "x-handshake-token: $WORKER_HANDSHAKE_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"run_id": "'$RUN_ID'"}' \
-            "$WORKER_URL/api/node/$SLOT/tunnel-claim")
+            "$WORKER_URL/api/node/$SLOT/config")
           
           echo "Worker Response: $RESPONSE"
           
-          TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
           REDIS_BASE=$(echo "$RESPONSE" | jq -r '.config.redis_base // empty')
           ADMIN_SECRET=$(echo "$RESPONSE" | jq -r '.config.admin_secret // empty')
           WORKER_URL_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.worker_url // empty')
           HANDSHAKE_TOKEN_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.handshake_token // empty')
           
-          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-            echo "[ERROR] Failed to get tunnel token from Worker"
+          if [ -z "$REDIS_BASE" ] || [ "$REDIS_BASE" = "null" ]; then
+            echo "[ERROR] REDIS_BASE not returned by Worker"
             echo "$RESPONSE" | jq .
             exit 1
           fi
           
-          if [ -z "$REDIS_BASE" ] || [ "$REDIS_BASE" = "null" ]; then
-            echo "[ERROR] REDIS_BASE not returned by Worker"
-            exit 1
-          fi
-          
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
           echo "redis_base=$REDIS_BASE" >> $GITHUB_OUTPUT
           echo "admin_secret=$ADMIN_SECRET" >> $GITHUB_OUTPUT
           echo "worker_url=$WORKER_URL_RECEIVED" >> $GITHUB_OUTPUT
           echo "handshake_token=$HANDSHAKE_TOKEN_RECEIVED" >> $GITHUB_OUTPUT
           
           echo "[SUCCESS] Config fetched from Worker:"
-          echo "  - Tunnel Token: ${TOKEN:0:20}..."
           echo "  - Redis Base: $REDIS_BASE"
           echo "  - Worker URL: $WORKER_URL_RECEIVED"
 
@@ -170,7 +159,40 @@ jobs:
             echo "=================================================="
           fi
 
-      - name: "7. Install 9Router CLI"
+      - name: "7. Claim Lock & Fetch Tunnel Token"
+        if: steps.lock_check.outputs.locked != 'true'
+        id: claim_tunnel
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_HANDSHAKE_TOKEN: ${{ secrets.WORKER_HANDSHAKE_TOKEN }}
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          RUN_ID: ${{ steps.node_meta.outputs.run_id }}
+        run: |
+          echo "[STEP 7] Claiming lock and fetching tunnel token..."
+          
+          # Claim lock with --force (takeover if needed)
+          python3 scripts/monitor.py check-lock --slot "$SLOT" --force
+          
+          # Now lock exists, call tunnel-claim
+          RESPONSE=$(curl -s -X POST \
+            -H "x-handshake-token: $WORKER_HANDSHAKE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"run_id": "'$RUN_ID'"}' \
+            "$WORKER_URL/api/node/$SLOT/tunnel-claim")
+          
+          echo "Tunnel Claim Response: $RESPONSE"
+          
+          TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "[ERROR] Failed to get tunnel token"
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+          
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "[SUCCESS] Tunnel token acquired: ${TOKEN:0:20}..."
+
+      - name: "8. Install 9Router CLI"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
           echo "[STEP 6] Installing 9Router globally via npm..."
@@ -302,7 +324,23 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
           echo "[SUCCESS] cloudflared $(cloudflared --version) installed and ready for authenticated handshake."
 
-      - name: "11. Launch Telemetry, Authenticated Tunnel Handshake & Lease Daemon"
+      - name: "11. Start Cloudflare Tunnel (with claimed token)"
+        if: steps.lock_check.outputs.locked != 'true'
+        env:
+          TUNNEL_TOKEN: ${{ steps.claim_tunnel.outputs.token }}
+        run: |
+          echo "[STEP 11] Starting Cloudflare Tunnel..."
+          nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+          sleep 3
+          if curl -s --max-time 5 "http://127.0.0.1:4040/api/tunnels" | grep -q "healthy"; then
+            echo "[SUCCESS] Cloudflare Tunnel is running"
+          else
+            echo "[WARN] Tunnel may still be starting, check /tmp/cloudflared.log"
+            cat /tmp/cloudflared.log
+          fi
+
+      - name: "12. Launch Telemetry, Authenticated Tunnel Handshake & Lease Daemon"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           NODE: ${{ steps.node_meta.outputs.canonical_slot }}
@@ -314,7 +352,7 @@ jobs:
           WORKER_HANDSHAKE_TOKEN: ${{ steps.fetch_config.outputs.handshake_token }}
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "[STEP 11] Running 2-Key Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
+          echo "[STEP 12] Running 2-Key Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
           python3 -u scripts/monitor.py run \
             --slot "$NODE" \
             --name "$NODE_NAME" \
