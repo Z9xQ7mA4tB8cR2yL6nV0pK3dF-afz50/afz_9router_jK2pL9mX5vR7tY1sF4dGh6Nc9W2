@@ -170,8 +170,8 @@ jobs:
         run: |
           echo "[STEP 7] Claiming lock and fetching tunnel token..."
           
-          # Claim lock with --force (takeover if needed)
-          python3 scripts/monitor.py check-lock --slot "$SLOT" --force
+          # Claim lock with --force (takeover if needed) - must pass run_id to claim lock
+          python3 scripts/monitor.py check-lock --slot "$SLOT" --force --run-id "$RUN_ID" --redis-base "${{ steps.fetch_config.outputs.redis_base }}"
           
           # Now lock exists, call tunnel-claim
           RESPONSE=$(curl -s -X POST \
