@@ -201,6 +201,7 @@ jobs:
 
       - name: "8. Headlessly Pre-Seed Database (OpenCode Models)"
         if: steps.lock_check.outputs.locked != 'true'
+        id: seed
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
           REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
@@ -210,11 +211,21 @@ jobs:
           python3 scripts/seed_db.py
           
           DB_PATH="$HOME/.9router/db/data.sqlite"
+          KEY_FILE="$HOME/.9router/db/api_key.txt"
           if [ -f "$DB_PATH" ]; then
             echo "[SUCCESS] Database initialized at $DB_PATH"
             ls -lh "$DB_PATH"
           else
             echo "[ERROR] Database file not found!"
+            exit 1
+          fi
+          
+          if [ -f "$KEY_FILE" ]; then
+            API_KEY=$(cat "$KEY_FILE")
+            echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
+            echo "[SUCCESS] API key captured: ${API_KEY:0:12}..."
+          else
+            echo "[ERROR] API key file not found!"
             exit 1
           fi
 
@@ -304,7 +315,8 @@ jobs:
           fi
           
           echo "[INFO] Starting Local Gateway on public port $PORT (Slot: $SLOT -> Internal: $ENGINE_PORT)..."
-          node scripts/gateway.js --port "$PORT" --target-port "$ENGINE_PORT" --slot "$SLOT" &
+          ROUTER_API_KEY="${{ steps.seed.outputs.api_key }}"
+          ROUTER_API_KEY="$ROUTER_API_KEY" node scripts/gateway.js --port "$PORT" --target-port "$ENGINE_PORT" --slot "$SLOT" &
           
           echo "[INFO] Waiting for port $PORT to become active..."
           for i in {1..30}; do
