@@ -729,12 +729,18 @@ def cmd_check_lock(args):
     lock_key = f"9rt:lock:{slot}"
 
     if getattr(args, "force", False):
-        log("PREFLIGHT", f"Force flag active! Bypassing lock check for slot '{slot}'...")
+        log("PREFLIGHT", f"Force flag active! Claiming lock for slot '{slot}'...")
+        # Generate run_id if not provided
+        run_id = getattr(args, "run_id", None) or f"{slot}_{int(time.time())}"
+        # Claim the lock in Redis (TTL 60s)
+        redis_setex_str(redis_base, lock_key, 60, run_id)
+        log("PREFLIGHT", f"Lock claimed for '{slot}' with run_id '{run_id}'")
         gh_output = os.environ.get("GITHUB_OUTPUT")
         if gh_output and os.path.exists(gh_output):
             with open(gh_output, "a") as f:
                 f.write("is_locked=false\n")
                 f.write(f"canonical_slot={slot}\n")
+                f.write(f"run_id={run_id}\n")
         sys.exit(0)
 
     log("PREFLIGHT", f"Checking lock for slot '{slot}' ({lock_key})...")
@@ -1356,6 +1362,7 @@ def main():
     p_check = subparsers.add_parser("check-lock", help="Pre-flight check if slot is actively locked")
     p_check.add_argument("--slot", required=True, help="Target slot name (e.g. node-1 or node-3)")
     p_check.add_argument("--force", action="store_true", help="Force run: bypass lock check and take over slot")
+    p_check.add_argument("--run-id", help="Explicit session RUN_ID (required with --force to claim lock)")
     p_check.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
 
     # Subcommand: run
