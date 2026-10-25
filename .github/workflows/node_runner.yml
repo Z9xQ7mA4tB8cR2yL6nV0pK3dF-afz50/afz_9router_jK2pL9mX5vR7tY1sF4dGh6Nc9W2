@@ -253,6 +253,26 @@ jobs:
 
           echo "[INFO] Testing WARP SOCKS5 egress IP..."
           curl -s --socks5 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=' || echo "[WARN] Trace check skipped."
+          
+          # Verify SOCKS5 proxy actually works for HTTP requests
+          echo "[INFO] Verifying SOCKS5 proxy for HTTP requests..."
+          for i in {1..5}; do
+            PROXY_TEST=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://httpbin.org/ip 2>/dev/null || echo "FAILED")
+            if echo "$PROXY_TEST" | grep -q '"origin"'; then
+              PROXY_IP=$(echo "$PROXY_TEST" | grep -o '"origin": "[^"]*"' | cut -d'"' -f4)
+              echo "[SUCCESS] SOCKS5 proxy working! Egress IP via WARP: $PROXY_IP"
+              break
+            fi
+            echo "[RETRY $i/5] SOCKS5 proxy not ready, waiting..."
+            sleep 3
+          done
+          
+          if ! echo "$PROXY_TEST" | grep -q '"origin"'; then
+            echo "[ERROR] SOCKS5 proxy verification FAILED after 5 attempts!"
+            echo "[ERROR] WARP proxy on port 40000 is not functional. Check warp-svc status."
+            warp-cli --accept-tos status
+            exit 1
+          fi
 
       - name: "9. Launch 9Router Engine (Headless Daemon Mode)"
         if: steps.lock_check.outputs.locked != 'true'
@@ -351,6 +371,10 @@ jobs:
           WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
           WORKER_HANDSHAKE_TOKEN: ${{ steps.fetch_config.outputs.handshake_token }}
           PYTHONUNBUFFERED: "1"
+          ALL_PROXY: "socks5://127.0.0.1:40000"
+          HTTP_PROXY: "http://127.0.0.1:40000"
+          HTTPS_PROXY: "http://127.0.0.1:40000"
+          NO_PROXY: "localhost,127.0.0.1"
         run: |
           echo "[STEP 12] Running 2-Key Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
           python3 -u scripts/monitor.py run \
