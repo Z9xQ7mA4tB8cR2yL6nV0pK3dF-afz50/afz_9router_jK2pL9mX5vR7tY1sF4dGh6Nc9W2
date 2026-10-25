@@ -60,39 +60,17 @@ jobs:
       - name: "1. Checkout Repository"
         uses: actions/checkout@v4
 
-      - name: "2. Set Up Python Environment"
+- name: "2. Set Up Python Environment"
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: "3. Pre-Flight Lock Check (Fast Abort)"
-        id: lock_check
-        run: |
-          FORCE_FLAG=""
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            FORCE_FLAG="--force"
-            echo "[INFO] Force override enabled! Bypassing lock check."
-          fi
-          
-          echo "[STEP 3] Pre-flight checking lock for slot ${{ matrix.node_id }}..."
-          if python3 scripts/monitor.py check-lock --slot "${{ matrix.node_id }}" $FORCE_FLAG; then
-            echo "locked=false" >> $GITHUB_OUTPUT
-          else
-            echo "locked=true" >> $GITHUB_OUTPUT
-            echo "=================================================="
-            echo "  [ABORT] Active lock detected for ${{ matrix.node_id }}."
-            echo "  Duplicate run terminated cleanly without changes."
-            echo "=================================================="
-          fi
-
-      - name: "4. Set Up Node.js and System Tools"
-        if: steps.lock_check.outputs.locked != 'true'
+      - name: "3. Set Up Node.js and System Tools"
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: "5. Resolve Dynamic Port (Formula: 6000 + N) and Identity"
-        if: steps.lock_check.outputs.locked != 'true'
+      - name: "4. Resolve Dynamic Port (Formula: 6000 + N) and Identity"
         id: node_meta
         run: |
           NODE="${{ matrix.node_id }}"
@@ -127,8 +105,7 @@ jobs:
           echo "node_name=$NODE_NAME" >> $GITHUB_OUTPUT
           echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
 
-      - name: "6. Fetch Runner Config from Worker (Single Source of Truth)"
-        if: steps.lock_check.outputs.locked != 'true'
+      - name: "5. Fetch Runner Config from Worker (Single Source of Truth)"
         id: fetch_config
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
@@ -136,7 +113,7 @@ jobs:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           RUN_ID: ${{ steps.node_meta.outputs.run_id }}
         run: |
-          echo "[STEP 6] Fetching runner config from Worker..."
+          echo "[STEP 5] Fetching runner config from Worker..."
           RESPONSE=$(curl -s -X POST \
             -H "x-handshake-token: $WORKER_HANDSHAKE_TOKEN" \
             -H "Content-Type: application/json" \
@@ -171,8 +148,27 @@ jobs:
           echo "[SUCCESS] Config fetched from Worker:"
           echo "  - Tunnel Token: ${TOKEN:0:20}..."
           echo "  - Redis Base: $REDIS_BASE"
-          echo "  - Router API Key: ${ROUTER_API_KEY:0:10}..."
           echo "  - Worker URL: $WORKER_URL_RECEIVED"
+
+      - name: "6. Pre-Flight Lock Check (Fast Abort) - Using Worker's Redis"
+        id: lock_check
+        run: |
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+            echo "[INFO] Force override enabled! Bypassing lock check."
+          fi
+          
+          echo "[STEP 6] Pre-flight checking lock for slot ${{ steps.node_meta.outputs.canonical_slot }} using Worker's Redis..."
+          if python3 scripts/monitor.py check-lock --slot "${{ steps.node_meta.outputs.canonical_slot }}" --redis-base "${{ steps.fetch_config.outputs.redis_base }}" $FORCE_FLAG; then
+            echo "locked=false" >> $GITHUB_OUTPUT
+          else
+            echo "locked=true" >> $GITHUB_OUTPUT
+            echo "=================================================="
+            echo "  [ABORT] Active lock detected for ${{ steps.node_meta.outputs.canonical_slot }}."
+            echo "  Duplicate run terminated cleanly without changes."
+            echo "=================================================="
+          fi
 
       - name: "7. Install 9Router CLI"
         if: steps.lock_check.outputs.locked != 'true'
