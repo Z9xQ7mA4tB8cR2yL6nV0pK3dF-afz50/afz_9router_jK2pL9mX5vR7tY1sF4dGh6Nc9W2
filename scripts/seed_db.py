@@ -136,8 +136,14 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
     cur.execute("DELETE FROM providerConnections WHERE id = 'conn-api-airforce' OR provider LIKE '%airforce%'")
     cur.execute("DELETE FROM kv WHERE scope = 'customModels' AND key LIKE 'af|%'")
 
-    # NOTE: Do NOT insert apiKeys - let 9Router generate its own unique key per node
-    # This avoids overwriting 9Router's auto-generated master key
+    # Generate unique API key for this node (random, not shared)
+    import secrets
+    api_key = "sk-" + secrets.token_urlsafe(32)
+    cur.execute("""
+        INSERT OR REPLACE INTO apiKeys (id, key, name, machineId, isActive, createdAt)
+        VALUES ('0243e23f-696e-4b54-a690-1ed6ed4dbb25', ?, 'Default Key', 'cloud-node', 1, datetime('now'))
+    """, (api_key,))
+    print(f"[SEED] Generated unique API key for this node: {api_key[:12]}...")
 
     # 3. Register Discovered Models into 9Router
     models = custom_models if custom_models else fetch_live_opencode_models()
