@@ -250,7 +250,7 @@ jobs:
           echo "$RESPONSE" | jq . || echo "$RESPONSE"
           echo "-------------------------------------------------------------"
           
-          if echo "$RESPONSE" | grep -q "mimo-v2.5-free"; then
+          if echo "$RESPONSE" | jq -e '.data | length > 0 or .models | length > 0' >/dev/null 2>&1; then
             echo "[VERIFIED] OpenCode Free models loaded and ready!"
           else
             echo "[INFO] Response received from models endpoint."
