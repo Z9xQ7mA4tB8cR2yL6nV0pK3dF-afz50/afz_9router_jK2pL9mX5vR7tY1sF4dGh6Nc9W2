@@ -120,13 +120,18 @@ def calculate_port(slot: str) -> int:
         return port
     return 6001
 
-def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3) -> str:
+def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3, use_proxy: bool = True) -> str:
     """
-    Queries external IP reflection endpoint through SOCKS5 proxy to verify WARP egress IP.
+    Queries external IP reflection endpoint to verify egress IP.
+    If use_proxy=False, uses direct connection (for when WARP is disabled).
     """
     endpoints = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
     curl_bin = shutil.which("curl")
-    if curl_bin:
+    if not curl_bin:
+        return "127.0.0.1"
+
+    if use_proxy:
+        # Try through WARP SOCKS5 proxy first
         for ep in endpoints:
             try:
                 cmd = [curl_bin, "-s", "--max-time", str(timeout), "--socks5", proxy_addr, ep]
@@ -136,15 +141,18 @@ def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3)
                     return ip
             except Exception:
                 continue
-        # Fallback direct curl if WARP socks5 not up yet
+
+    # Fallback: direct connection (no proxy) - for when WARP is disabled or proxy unavailable
+    for ep in endpoints:
         try:
-            cmd = [curl_bin, "-s", "--max-time", str(timeout), "https://api.ipify.org"]
+            cmd = [curl_bin, "-s", "--max-time", str(timeout), ep]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
             ip = res.stdout.strip()
             if ip and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                 return ip
         except Exception:
-            pass
+            continue
+
     return "127.0.0.1"
 
 # ----------------- Thread-Safe Shared Node State -----------------
@@ -408,14 +416,17 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
         time.sleep(2)
 
     # Detect new egress IP
-    fresh_ip = detect_warp_egress_ip()
+    if enable:
+        fresh_ip = detect_warp_egress_ip(use_proxy=True)
+    else:
+        fresh_ip = detect_warp_egress_ip(use_proxy=False)
     state.update_warp_ip(fresh_ip)
     
     # Update warp_enabled flag and vm_ip
     state.set_warp_enabled(enable)
     if not enable:
         # When WARP is disabled, detect direct VM IP
-        vm_ip = detect_warp_egress_ip()  # This will fall back to direct IP when WARP is off
+        vm_ip = detect_warp_egress_ip(use_proxy=False)
         state.update_vm_ip(vm_ip)
     
     state.update_health(
