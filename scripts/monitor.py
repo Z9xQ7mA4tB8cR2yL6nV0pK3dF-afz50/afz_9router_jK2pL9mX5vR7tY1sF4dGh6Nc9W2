@@ -1040,6 +1040,24 @@ def run_local_log_server(slot: str, port: int):
     except Exception:
         pass
 
+def get_local_api_key(db_path=None):
+    """Read API key from 9Router SQLite database."""
+    if db_path is None:
+        db_path = os.path.expanduser("~/.9router/db/data.sqlite")
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT key FROM apiKeys WHERE isActive = 1 LIMIT 1")
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception as e:
+        log("WARN", f"Could not read API key from DB: {e}")
+    return None
+
+
 def cmd_run_daemon(args):
     slot = normalize_slot(args.slot)
     port = args.port or calculate_port(slot)
@@ -1066,6 +1084,13 @@ def cmd_run_daemon(args):
     log("INIT", f"Heartbeat Key  : {hb_key}")
     log("INIT", f"Redis API Base : {redis_base}")
     print("=" * 70, flush=True)
+
+    # Read API key from local 9Router DB (auto-generated during seed)
+    local_api_key = get_local_api_key()
+    if local_api_key:
+        log("INIT", f"Loaded API key from local DB: {local_api_key[:12]}...")
+    else:
+        log("WARN", "No API key found in local DB, model discovery may fail")
 
     # Initialize Thread-Safe Shared State
     state = NodeSharedState(slot, node_name, port, run_id, gh_run_id, boot_timestamp)
@@ -1161,10 +1186,13 @@ def cmd_run_daemon(args):
         discovered_items = snap.get("discovered_models", [])
         discovered_providers = snap.get("providers", [])
 
+        # Use local API key from DB for engine auth
+        engine_api_key = local_api_key or api_key
+
         try:
             req = urllib.request.Request(
                 models_url,
-                headers={"Authorization": f"Bearer {api_key}"}
+                headers={"Authorization": f"Bearer {engine_api_key}"}
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 if resp.status == 200:
