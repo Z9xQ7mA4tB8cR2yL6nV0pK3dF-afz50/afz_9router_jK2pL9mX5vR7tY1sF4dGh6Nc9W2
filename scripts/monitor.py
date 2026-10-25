@@ -377,11 +377,38 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
     - enable=True: Connect WARP (register, set proxy mode, connect)
     - enable=False: Disconnect WARP, stop warp-svc, clean registration
     Returns the new egress IP.
+    
+    NOTE: In CI/GitHub Actions, WARP management is skipped (network breaks).
+    Only updates state for UI consistency.
     """
+    # Skip actual WARP management in CI environments (GitHub Actions, etc.)
+    # WARP disconnect breaks network routing in containerized CI runners
+    in_ci = os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true"
+    
     warp_bin = shutil.which("warp-cli")
-    if not warp_bin:
-        log("WARP_WARN", "warp-cli not found on PATH. Cannot toggle WARP.")
-        return "127.0.0.1"
+    if not warp_bin or in_ci:
+        if in_ci:
+            log("WARP", f"CI environment detected - SIMULATING WARP {'enable' if enable else 'disable'}")
+        else:
+            log("WARP_WARN", "warp-cli not found on PATH. Cannot toggle WARP.")
+        
+        # Simulate: just update state, detect direct IP
+        fresh_ip = detect_warp_egress_ip(use_proxy=False)
+        state.update_warp_ip(fresh_ip)
+        state.set_warp_enabled(enable)
+        if not enable:
+            state.update_vm_ip(fresh_ip)
+        
+        snap = state.get_snapshot()
+        models_cnt = snap["models_count"]
+        state.update_health(
+            is_healthy=True,
+            models_count=models_cnt,
+            status="online",
+            status_msg=f"WARP {'enabled' if enable else 'disabled'} (simulated). Egress IP: {fresh_ip}"
+        )
+        log("WARP", f"WARP {'enabled' if enable else 'disabled'} for {state.slot} (simulated). Egress IP: {fresh_ip}")
+        return fresh_ip
 
     snap = state.get_snapshot()
     models_cnt = snap["models_count"]
@@ -449,7 +476,7 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
     """
     snap = state.get_snapshot()
     models_cnt = snap["models_count"]
-    warp_enabled = snap.get("warp_enabled", True)
+    warp_enabled = snap.get("warp_enabled", False)  # Default FALSE - never auto-re-enable
     slot = snap["slot"]
     rule_tag = f"[{rule}] " if rule else ""
 
