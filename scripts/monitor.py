@@ -325,6 +325,63 @@ class RateLimitDecisionEngine:
         self.consecutive_rl_count = 0
         self.cumulative_wait_sec = 0.0
 
+def toggle_warp(state: NodeSharedState, enable: bool) -> str:
+    """
+    Toggle WARP on/off.
+    - enable=True: Connect WARP (register, set proxy mode, connect)
+    - enable=False: Disconnect WARP, stop warp-svc, clean registration
+    Returns the new egress IP.
+    """
+    warp_bin = shutil.which("warp-cli")
+    if not warp_bin:
+        log("WARP_WARN", "warp-cli not found on PATH. Cannot toggle WARP.")
+        return "127.0.0.1"
+
+    snap = state.get_snapshot()
+    models_cnt = snap["models_count"]
+
+    if enable:
+        log("WARP", f"Enabling WARP for {state.slot}...")
+        state.update_health(
+            is_healthy=False,
+            models_count=models_cnt,
+            status="warp_connecting",
+            status_msg="Connecting Cloudflare WARP..."
+        )
+        # Connect WARP
+        run_cmd([warp_bin, "--accept-tos", "registration", "new"])
+        run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
+        run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
+        run_cmd([warp_bin, "--accept-tos", "connect"])
+        time.sleep(3)
+    else:
+        log("WARP", f"Disabling WARP for {state.slot}...")
+        state.update_health(
+            is_healthy=False,
+            models_count=models_cnt,
+            status="warp_disconnecting",
+            status_msg="Disconnecting Cloudflare WARP..."
+        )
+        # Disconnect and destroy WARP
+        run_cmd([warp_bin, "--accept-tos", "disconnect"])
+        run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
+        run_cmd(["sudo", "systemctl", "stop", "warp-svc"])
+        run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
+        time.sleep(2)
+
+    # Detect new egress IP
+    fresh_ip = detect_warp_egress_ip()
+    state.update_warp_ip(fresh_ip)
+    state.update_health(
+        is_healthy=True,
+        models_count=models_cnt,
+        status="online",
+        status_msg=f"WARP {'enabled' if enable else 'disabled'}. Egress IP: {fresh_ip}"
+    )
+    log("WARP", f"WARP {'enabled' if enable else 'disabled'} for {state.slot}. New egress IP: {fresh_ip}")
+    return fresh_ip
+
+
 def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "") -> bool:
     """
     Executes Cloudflare WARP IP rotation:
@@ -674,6 +731,15 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                         ack_payload["new_ip"] = fresh_ip
                         ack_payload["message"] = f"WARP IP rotated to {fresh_ip}."
                         log("CMD_CONSUMER", f"WARP IP rotated to: {fresh_ip}")
+
+                    elif action == "warp_toggle":
+                        enable = cmd.get("enable", True)
+                        log("CMD_CONSUMER", f"Executing WARP toggle: enable={enable}")
+                        fresh_ip = toggle_warp(state, enable)
+                        ack_payload["new_ip"] = fresh_ip
+                        ack_payload["warp_enabled"] = enable
+                        ack_payload["message"] = f"WARP {'enabled' if enable else 'disabled'}. Egress IP: {fresh_ip}"
+                        log("CMD_CONSUMER", f"WARP {'enabled' if enable else 'disabled'} for {state.slot}. New egress IP: {fresh_ip}")
 
                     else:
                         ack_payload["status"] = "ignored"
