@@ -15,16 +15,6 @@ import re
 import urllib.request
 import urllib.error
 
-# Curated resilient baseline (guaranteed fallback if live discovery fails)
-BASELINE_MODELS = [
-    ("big-pickle", "big-pickle"),
-    ("mimo-v2.5-free", "mimo-v2.5-free"),
-    ("nemotron-3-ultra-free", "nemotron-3-ultra-free"),
-    ("nemotron-3.5-lightning-free", "nemotron-3.5-lightning-free"),
-    ("muse-spark-1.3-contributor-free", "muse-spark-1.3-contributor-free"),
-    ("ling-3.0-flash-fin-free", "ling-3.0-flash-fin-free"),
-]
-
 def get_target_db_path(explicit_path=None):
     if explicit_path:
         return explicit_path
@@ -71,12 +61,7 @@ def fetch_live_opencode_models():
         except Exception:
             continue
 
-    # Ensure 'big-pickle' is always in the list
-    has_pickle = any("big-pickle" in m[0].lower() for m in discovered)
-    if not has_pickle:
-        discovered.insert(0, ("big-pickle", "big-pickle"))
-
-    return discovered if discovered else BASELINE_MODELS
+    return discovered
 
 def seed(custom_combo=None, db_path=None, custom_models=None):
     custom_models = custom_models or custom_combo
@@ -151,11 +136,8 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
     cur.execute("DELETE FROM providerConnections WHERE id = 'conn-api-airforce' OR provider LIKE '%airforce%'")
     cur.execute("DELETE FROM kv WHERE scope = 'customModels' AND key LIKE 'af|%'")
 
-    api_key = os.environ.get("ROUTER_API_KEY", "sk-361ddf48ad95487f-l1vj9z-499b11a6")
-    cur.execute("""
-        INSERT OR REPLACE INTO apiKeys (id, key, name, machineId, isActive, createdAt)
-        VALUES ('0243e23f-696e-4b54-a690-1ed6ed4dbb25', ?, 'Default Key', 'cloud-node', 1, datetime('now'))
-    """, (api_key,))
+    # NOTE: Do NOT insert apiKeys - let 9Router generate its own unique key per node
+    # This avoids overwriting 9Router's auto-generated master key
 
     # 3. Register Discovered Models into 9Router
     models = custom_models if custom_models else fetch_live_opencode_models()
