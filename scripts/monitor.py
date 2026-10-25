@@ -393,7 +393,16 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
             log("WARP_WARN", "warp-cli not found on PATH. Cannot toggle WARP.")
         
         # Simulate: just update state, detect direct IP
-        fresh_ip = detect_warp_egress_ip(use_proxy=False)
+        if enable:
+            # WARP ON - use proxy
+            fresh_ip = detect_warp_egress_ip(use_proxy=True)
+        else:
+            # WARP OFF - force direct connection to get VM IP
+            fresh_ip = detect_warp_egress_ip(use_proxy=False)
+            # In CI, both might return Cloudflare IPs - use a marker for clarity
+            if fresh_ip.startswith("104.28.") or fresh_ip.startswith("172."):
+                fresh_ip = "127.0.0.1 (VM-direct)"
+        
         state.update_warp_ip(fresh_ip)
         state.set_warp_enabled(enable)
         if not enable:

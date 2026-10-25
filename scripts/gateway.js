@@ -26,6 +26,9 @@ const TARGET_PORT = parseInt(getArg("--target-port", process.env.TARGET_PORT || 
 const SLOT = getArg("--slot", process.env.NODE || "node-1");
 const LOG_FILE = getArg("--log-file", "/tmp/runner.log");
 
+// 9Router API Key for local engine auth (injected by workflow from seeded DB)
+const ROUTER_API_KEY = getArg("--router-api-key", process.env.ROUTER_API_KEY || "");
+
 // Kilo AI Gateway channel (remote-egress quota multiplier).
 // Local 9Router Base URL shape: https://<node-subdomain>/kilo/v1
 // 9Router blindly appends /models and /chat/completions, so both must work.
@@ -376,6 +379,11 @@ const server = http.createServer((req, res) => {
   // 4. Reverse-Proxy ALL other requests to 9Router on TARGET_PORT
   const headers = { ...req.headers };
   headers.host = `127.0.0.1:${TARGET_PORT}`;
+
+  // Inject 9Router API key if available and no Authorization header present
+  if (ROUTER_API_KEY && !headers.authorization) {
+    headers.authorization = `Bearer ${ROUTER_API_KEY}`;
+  }
 
   const proxyReq = http.request(
     {

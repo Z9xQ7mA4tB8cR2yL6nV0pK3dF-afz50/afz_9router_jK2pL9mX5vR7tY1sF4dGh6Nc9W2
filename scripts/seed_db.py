@@ -145,6 +145,11 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
         VALUES ('0243e23f-696e-4b54-a690-1ed6ed4dbb25', ?, 'Default Key', 'cloud-node', 1, datetime('now'))
     """, (api_key,))
     print(f"[SEED] Generated unique API key for this node: {api_key[:12]}...")
+    # Write API key to file for gateway consumption
+    key_file = os.path.join(os.path.dirname(db_path), "api_key.txt")
+    with open(key_file, "w") as f:
+        f.write(api_key)
+    print(f"[SEED] API key written to {key_file}")
 
     # 3. Register Discovered Models into 9Router
     models = custom_models if custom_models else fetch_live_opencode_models()
