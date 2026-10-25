@@ -122,7 +122,8 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
     settings_data = {
         "providerStrategies": {},
         "quotaVisibility": {},
-        "tunnelDashboardAccess": True
+        "tunnelDashboardAccess": True,
+        "requireAuth": False  # Allow unauthenticated access to /v1/models for free models
     }
     cur.execute("INSERT OR REPLACE INTO settings (id, data) VALUES (1, ?)", (json.dumps(settings_data),))
     
