@@ -44,6 +44,32 @@ if hasattr(sys.stdout, "reconfigure"):
 
 DEFAULT_REDIS_BASE = "https://jelab101-rimjhim.hf.space"
 
+def run_cmd(cmd_args, input_text=None, timeout=30):
+    """Module-level command runner for WARP operations."""
+    cmd_str = " ".join(cmd_args)
+    log("CMD_EXEC", f"Running: {cmd_str}")
+    try:
+        res = subprocess.run(
+            cmd_args,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        out = res.stdout.strip()
+        err = res.stderr.strip()
+        if out:
+            for line in out.splitlines():
+                log("CMD_OUT", f"  {line}")
+        if err:
+            for line in err.splitlines():
+                log("CMD_ERR", f"  {line}")
+        log("CMD_STATUS", f"Command completed with exit code: {res.returncode}")
+        return res
+    except Exception as exc:
+        log("CMD_FAIL", f"Command execution exception: {exc}")
+        return None
+
 _LOG_BUFFER_LOCK = threading.Lock()
 _LOG_BUFFER = collections.deque(maxlen=100)
 
@@ -437,31 +463,6 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
             status_msg="WARP simulated rotation complete (mock)"
         )
         return True
-
-    def run_cmd(cmd_args, input_text=None, timeout=30):
-        cmd_str = " ".join(cmd_args)
-        log("CMD_EXEC", f"Running: {cmd_str}")
-        try:
-            res = subprocess.run(
-                cmd_args,
-                input=input_text,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            out = res.stdout.strip()
-            err = res.stderr.strip()
-            if out:
-                for line in out.splitlines():
-                    log("CMD_OUT", f"  {line}")
-            if err:
-                for line in err.splitlines():
-                    log("CMD_ERR", f"  {line}")
-            log("CMD_STATUS", f"Command completed with exit code: {res.returncode}")
-            return res
-        except Exception as exc:
-            log("CMD_FAIL", f"Command execution exception: {exc}")
-            return None
 
     def probe_trace(stage_label: str) -> str:
         log("TEST_TRACE", f"[{stage_label}] Querying Cloudflare Edge Trace (/cdn-cgi/trace)...")
