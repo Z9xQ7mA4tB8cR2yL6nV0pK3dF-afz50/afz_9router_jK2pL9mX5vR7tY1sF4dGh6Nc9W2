@@ -408,11 +408,10 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
             status="warp_disconnecting",
             status_msg="Disconnecting Cloudflare WARP..."
         )
-        # Disconnect and destroy WARP
+        # Disconnect WARP (keep warp-svc running, just disconnect)
         run_cmd([warp_bin, "--accept-tos", "disconnect"])
         run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
-        run_cmd(["sudo", "systemctl", "stop", "warp-svc"])
-        run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
+        # DO NOT stop warp-svc or delete dirs - that breaks network routing
         time.sleep(2)
 
     # Detect new egress IP
