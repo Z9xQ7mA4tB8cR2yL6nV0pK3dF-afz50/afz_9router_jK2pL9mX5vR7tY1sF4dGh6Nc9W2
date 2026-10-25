@@ -138,6 +138,8 @@ class NodeSharedState:
         self.is_healthy = False
         self.active_models_count = 0
         self.warp_ip = "127.0.0.1"
+        self.vm_ip = "127.0.0.1"
+        self.warp_enabled = True  # Default: WARP enabled
         self.models_list = []
         self.discovered_models = []
         self.providers = []
@@ -160,6 +162,14 @@ class NodeSharedState:
         with self.lock:
             self.warp_ip = ip
 
+    def update_vm_ip(self, ip: str):
+        with self.lock:
+            self.vm_ip = ip
+
+    def set_warp_enabled(self, enabled: bool):
+        with self.lock:
+            self.warp_enabled = enabled
+
     def get_snapshot(self):
         with self.lock:
             return {
@@ -174,6 +184,8 @@ class NodeSharedState:
                 "is_healthy": self.is_healthy,
                 "models_count": self.active_models_count,
                 "warp_ip": self.warp_ip,
+                "vm_ip": self.vm_ip,
+                "warp_enabled": self.warp_enabled,
                 "models_list": list(self.models_list),
                 "discovered_models": list(self.discovered_models),
                 "providers": list(self.providers),
@@ -372,6 +384,14 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
     # Detect new egress IP
     fresh_ip = detect_warp_egress_ip()
     state.update_warp_ip(fresh_ip)
+    
+    # Update warp_enabled flag and vm_ip
+    state.set_warp_enabled(enable)
+    if not enable:
+        # When WARP is disabled, detect direct VM IP
+        vm_ip = detect_warp_egress_ip()  # This will fall back to direct IP when WARP is off
+        state.update_vm_ip(vm_ip)
+    
     state.update_health(
         is_healthy=True,
         models_count=models_cnt,
@@ -382,16 +402,19 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
     return fresh_ip
 
 
-def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "") -> bool:
+def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "", redis_base: str = None) -> bool:
     """
     Executes Cloudflare WARP IP rotation:
     1. Updates shared state to 'rotating_ip' so heartbeat broadcasts to Redis.
     2. Runs warp-cli commands to disconnect and reconnect for a fresh Anycast edge IP.
     3. Verifies new outbound IP connectivity.
-    4. Restores state to 'online' and resets rate limit engine counters.
+    4. Checks if new IP is in Redis IP pool (if WARP enabled) - keeps rotating until fresh IP not in pool.
+    5. Restores state to 'online' and resets rate limit engine counters.
     """
     snap = state.get_snapshot()
     models_cnt = snap["models_count"]
+    warp_enabled = snap.get("warp_enabled", True)
+    slot = snap["slot"]
     rule_tag = f"[{rule}] " if rule else ""
 
     state.update_health(
@@ -472,21 +495,67 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         log("TEST_RESULT", f"[{stage_label}] Fallback IP reflection -> {fallback_ip}")
         return fallback_ip
 
+    def fetch_ip_pool():
+        """Fetch IP pool from Redis via worker API."""
+        if not redis_base:
+            return []
+        try:
+            url = f"{redis_base.rstrip('/')}/api/node/{slot}/ip-pool"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "9Router-Monitor/2.0", "Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("success") and isinstance(data.get("pool"), list):
+                    return [entry.get("ip") for entry in data["pool"] if entry.get("ip")]
+        except Exception as e:
+            log("IP_POOL_WARN", f"Failed to fetch IP pool: {e}")
+        return []
+
+    def is_ip_in_pool(ip, pool_ips):
+        """Check if IP is in the pool (exact match)."""
+        return ip in pool_ips
+
     try:
         # ======================================================================
-        # STAGE 0: BASELINE TRACE (Current Egress IP before rotation)
+        # STAGE 0: Check WARP status and fetch IP pool
+        # ======================================================================
+        if not warp_enabled:
+            log("WARP", "WARP is DISABLED. Skipping rotation, using direct VM IP.")
+            # Just detect current direct IP
+            vm_ip = detect_warp_egress_ip()
+            state.update_warp_ip(vm_ip)
+            state.update_vm_ip(vm_ip)
+            state.update_health(
+                is_healthy=True,
+                models_count=models_cnt,
+                status="online",
+                status_msg=f"WARP disabled. Direct VM IP: {vm_ip}"
+            )
+            return True
+
+        # WARP is enabled - fetch IP pool
+        ip_pool = fetch_ip_pool()
+        log("WARP", f"Current IP pool ({len(ip_pool)} entries): {ip_pool}")
+
+        # ======================================================================
+        # STAGE 1: BASELINE TRACE (Current Egress IP before rotation)
         # ======================================================================
         log("WARP", "Step 1: Inspecting baseline egress IP before rotation...")
         baseline_ip = probe_trace("BASELINE")
         log("WARP", f"Baseline Egress IP: {baseline_ip}")
 
         final_ip = baseline_ip
-        max_attempts = 4
+        max_attempts = 8  # Increased to allow pool avoidance
         start_time = time.time()
 
         for attempt in range(1, max_attempts + 1):
             elapsed = int(time.time() - start_time)
             log("WARP", f"--- IP Rotation Attempt #{attempt}/{max_attempts} (Elapsed: {elapsed}s) ---")
+
+            # Refresh pool before each attempt
+            ip_pool = fetch_ip_pool()
 
             if attempt == 1:
                 # Fast Re-registration Cycle (3-5s)
@@ -515,9 +584,9 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
                 run_cmd([warp_bin, "--accept-tos", "connect"])
                 time.sleep(3)
             else:
-                # Deep Cache/State Wipe & Extended Cooldown (~8s)
-                cooldown_sec = 8
-                log("WARP_WARN", f"Attempt #{attempt}: Deep state purge & {cooldown_sec}s edge session backoff...")
+                # Deep Cache/State Wipe & Extended Cooldown (10-30s)
+                cooldown_sec = min(10 + (attempt - 3) * 5, 30)  # 10s, 15s, 20s, 25s, 30s
+                log("WARP_WARN", f"Attempt #{attempt}: Deep state purge & {cooldown_sec}s edge session backoff (avoiding pooled IPs)...")
                 run_cmd([warp_bin, "--accept-tos", "disconnect"])
                 run_cmd(["sudo", "systemctl", "stop", "warp-svc"])
                 run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
@@ -532,16 +601,24 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
 
             run_cmd([warp_bin, "--accept-tos", "status"])
             cand_ip = probe_trace(f"ATTEMPT_{attempt}")
+            
+            # Check if new IP is different from baseline AND not in pool
             if cand_ip and cand_ip != "unknown" and cand_ip != baseline_ip:
-                final_ip = cand_ip
-                log("WARP", f"🎉 IP Rotation SUCCESS! IP changed from {baseline_ip} to {final_ip} (Attempt #{attempt}, Total: {int(time.time() - start_time)}s).")
-                break
+                if is_ip_in_pool(cand_ip, ip_pool):
+                    log("WARP_WARN", f"🎯 New IP {cand_ip} is IN POOL (blocked). Continuing rotation...")
+                    # Continue to next attempt
+                    continue
+                else:
+                    final_ip = cand_ip
+                    log("WARP", f"🎉 IP Rotation SUCCESS! IP changed from {baseline_ip} to {final_ip} (Attempt #{attempt}, Total: {int(time.time() - start_time)}s). IP is FRESH (not in pool).")
+                    break
             else:
                 log("WARP_WARN", f"Attempt #{attempt} completed: IP remains {cand_ip}. Will escalate/retry...")
 
         if final_ip == baseline_ip:
+            # Last resort - just get whatever IP we can
             final_ip = detect_warp_egress_ip()
-            log("WARP_WARN", f"Rotation attempts exhausted. Final active egress IP: {final_ip}")
+            log("WARP_WARN", f"Rotation attempts exhausted. Final active egress IP: {final_ip} (may be in pool)")
 
         state.update_warp_ip(final_ip)
         engine.on_warp_rotated()
@@ -725,7 +802,7 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                     if action == "rotate_ip":
                         log("CMD_CONSUMER", "Executing WARP IP rotation by command...")
                         if rl_engine:
-                            execute_warp_rotation(state, rl_engine, rule="USER_COMMAND")
+                            execute_warp_rotation(state, rl_engine, rule="USER_COMMAND", redis_base=redis_base)
                         fresh_ip = detect_warp_egress_ip()
                         state.update_warp_ip(fresh_ip)
                         ack_payload["new_ip"] = fresh_ip
@@ -845,6 +922,8 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "status": snap["status"],
             "status_msg": snap["status_msg"],
             "warp_ip": snap["warp_ip"],
+            "vm_ip": snap.get("vm_ip", "127.0.0.1"),
+            "warp_enabled": snap.get("warp_enabled", True),
             "provider": primary_provider,
             "providers": active_providers,
             "models": compact_models,
@@ -1175,7 +1254,7 @@ def cmd_run_daemon(args):
                 log("RL_DECISION", f"Decision: [{decision.rule}] -> {decision.action} ({decision.reason})")
 
                 if decision.action == DecisionResult.ACTION_SHIFT_TO_W:
-                    execute_warp_rotation(state, rl_engine, rule=decision.rule)
+                    execute_warp_rotation(state, rl_engine, rule=decision.rule, redis_base=redis_base)
                     continue
                 else:
                     status = "cooldown"
