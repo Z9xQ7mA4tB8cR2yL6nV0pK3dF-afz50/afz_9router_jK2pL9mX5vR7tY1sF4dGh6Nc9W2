@@ -426,11 +426,11 @@ jobs:
           
           echo "[STEP 9.5] Deploying OpenCode Proxy on port $PROXY_PORT for slot $SLOT..."
           
-          # Create proxy directory
-          mkdir -p /root/opencode-proxy
+          # Create proxy directory (runner user home)
+          mkdir -p /home/runner/opencode-proxy
           
           # Copy proxy.mjs from repo
-          cp scripts/proxy.mjs /root/opencode-proxy/proxy.mjs
+          cp scripts/proxy.mjs /home/runner/opencode-proxy/proxy.mjs
           
           # Start OpenCode server if not running
           if ! curl -s http://127.0.0.1:4096/v1/models >/dev/null 2>&1; then
@@ -446,7 +446,7 @@ jobs:
           HOST=127.0.0.1 \
           OPENCODE_URL=http://127.0.0.1:4096 \
           PROXY_API_KEY="${{ secrets.OPENCODE_PROXY_API_KEY }}" \
-          node /root/opencode-proxy/proxy.mjs >> /tmp/proxy.log 2>&1 &
+          node /home/runner/opencode-proxy/proxy.mjs >> /tmp/proxy.log 2>&1 &
           
           # Wait for proxy to be ready
           for i in {1..15}; do
