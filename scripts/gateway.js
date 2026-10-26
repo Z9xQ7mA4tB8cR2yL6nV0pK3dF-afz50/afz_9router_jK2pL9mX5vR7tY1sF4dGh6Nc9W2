@@ -58,6 +58,14 @@ const OPENCODE_PROXY_AUTH = OPENCODE_PROXY_API_KEY
   ? `Bearer ${OPENCODE_PROXY_API_KEY}`
   : "";
 
+// Normalize model name to providerID/modelID (same as original proxy.mjs)
+function normalizeModel(name) {
+  const value = String(name || "opencode/deepseek-v4.1-flash-free").trim()
+  const slash = value.indexOf("/")
+  if (slash === -1) return { providerID: "opencode", modelID: value }
+  return { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) }
+}
+
 // In-memory ring buffer for low latency
 let buffer = [];
 let fileOffset = 0;
