@@ -474,6 +474,78 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+    // 3.7.1 OpenCode Chat Completions via CLI: POST /open/v1/chat/completions
+    // Uses `opencode run` CLI since OpenCode server (4096) only serves Web UI
+    if (suffix.replace(/\/+$/, "") === "/v1/chat/completions" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", async () => {
+        let payload;
+        try {
+          payload = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { ...CORS_HEADERS, "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        }
+
+        const model = payload.model || "glm-5.3-flash-free";
+        const messages = payload.messages || [];
+        if (!messages.length) {
+          res.writeHead(400, { ...CORS_HEADERS, "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "messages array required" }));
+        }
+
+        // Build prompt from messages
+        const prompt = messages.map(m => `${m.role}: ${m.content}`).join("\n");
+
+        try {
+          const { spawn } = require("child_process");
+          const child = spawn("opencode", ["run", prompt, "--model", model], {
+            env: { ...process.env, PATH: `${process.env.HOME}/.opencode/bin:${process.env.PATH}` }
+          });
+
+          let output = "";
+          let errorOutput = "";
+          child.stdout.on("data", (data) => { output += data.toString(); });
+          child.stderr.on("data", (data) => { errorOutput += data.toString(); });
+
+          child.on("close", (code) => {
+            if (code !== 0) {
+              console.error(`[GATEWAY] opencode run failed (code ${code}): ${errorOutput}`);
+              res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: "OpenCode execution failed", details: errorOutput }));
+            }
+            
+            const content = output.trim();
+            res.writeHead(200, {
+              ...CORS_HEADERS,
+              "Content-Type": "application/json; charset=utf-8",
+            });
+            res.end(JSON.stringify({
+              id: "chatcmpl-" + Date.now(),
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content },
+                finish_reason: "stop"
+              }],
+              usage: {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0
+              }
+            }));
+          });
+        } catch (err) {
+          res.writeHead(500, { ...CORS_HEADERS, "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal error", message: err.message }));
+        }
+      });
+      return;
+    }
+
     // Generic OpenCode passthrough (chat/completions with SSE streaming, etc.)
     // No auth replacement needed - OpenCode Proxy handles its own auth
     let upstreamParsed;
