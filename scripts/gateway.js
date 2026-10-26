@@ -45,6 +45,19 @@ const KILO_FREE_ONLY_DEFAULT = String(
   getArg("--kilo-free-only", process.env.KILO_FREE_ONLY || "true")
 ).toLowerCase() === "true";
 
+// OpenCode Proxy configuration
+// Proxy port formula: 7005 + (slot_number * 10), e.g., node-1=7015, node-2=7025
+const slotMatch = String(SLOT).match(/(\d+)$/);
+const slotNum = slotMatch ? parseInt(slotMatch[1], 10) : 1;
+const OPENCODE_PROXY_PORT = 7005 + (slotNum * 10);
+const OPENCODE_PROXY_BASE = `http://127.0.0.1:${OPENCODE_PROXY_PORT}`;
+
+// OpenCode Proxy API Key (for authentication to the proxy)
+const OPENCODE_PROXY_API_KEY = process.env.OPENCODE_PROXY_API_KEY || "afz26";
+const OPENCODE_PROXY_AUTH = OPENCODE_PROXY_API_KEY
+  ? `Bearer ${OPENCODE_PROXY_API_KEY}`
+  : "";
+
 // In-memory ring buffer for low latency
 let buffer = [];
 let fileOffset = 0;
@@ -503,9 +516,9 @@ return;
           try {
             // Step 1: Create session (same as original proxy.mjs)
             const query = new URLSearchParams({ directory: "/home/runner/opencode-proxy/sandbox" });
-            const sessionRes = await fetch(`${UPSTREAM}/session?${query.toString()}`, {
+            const sessionRes = await fetch(`${OPENCODE_PROXY_BASE}/session?${query.toString()}`, {
               method: "POST",
-              headers: { "content-type": "application/json", ...(AUTH ? { authorization: AUTH } : {}) },
+              headers: { "content-type": "application/json", ...(OPENCODE_PROXY_AUTH ? { authorization: OPENCODE_PROXY_AUTH } : {}) },
               body: JSON.stringify({ title: "api: " + messages[0]?.content?.slice(0, 60) || "chat" })
             });
             const session = await sessionRes.json();
@@ -523,9 +536,9 @@ return;
             };
             if (variant) payload.variant = variant;
 
-            await fetch(`${UPSTREAM}/session/${sessionID}/prompt_async`, {
+            await fetch(`${OPENCODE_PROXY_BASE}/session/${sessionID}/prompt_async`, {
               method: "POST",
-              headers: { "content-type": "application/json", ...(AUTH ? { authorization: AUTH } : {}) },
+              headers: { "content-type": "application/json", ...(OPENCODE_PROXY_AUTH ? { authorization: OPENCODE_PROXY_AUTH } : {}) },
               body: JSON.stringify(payload)
             });
 
@@ -535,8 +548,8 @@ return;
             let finished = false;
 
             while (Date.now() < deadline && !finished) {
-              const messagesRes = await fetch(`${UPSTREAM}/session/${sessionID}/message`, {
-                headers: AUTH ? { authorization: AUTH } : {}
+              const messagesRes = await fetch(`${OPENCODE_PROXY_BASE}/session/${sessionID}/message`, {
+                headers: OPENCODE_PROXY_AUTH ? { authorization: OPENCODE_PROXY_AUTH } : {}
               });
               const messagesOut = await messagesRes.json();
               const assistants = (messagesOut || []).filter(m => m?.info?.role === "assistant");
@@ -565,7 +578,7 @@ return;
             if (!finished) throw new Error("OpenCode session timed out");
 
             // Clean up session
-            try { await fetch(`${UPSTREAM}/session/${sessionID}`, { method: "DELETE" }); } catch {}
+            try { await fetch(`${OPENCODE_PROXY_BASE}/session/${sessionID}`, { method: "DELETE" }); } catch {}
 
             // Return OpenAI-compatible response
             res.writeHead(200, {
