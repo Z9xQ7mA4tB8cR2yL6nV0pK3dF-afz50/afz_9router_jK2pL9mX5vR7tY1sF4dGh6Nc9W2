@@ -377,6 +377,147 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 3.7 OpenCode Proxy channel: /open/v1/* -> Local OpenCode Proxy (Dynamic Port)
+  // Result-focused: Local OpenCode Proxy on dynamic port per slot.
+  // OpenCode Proxy Base URL shape: http://localhost:<proxy_port>/v1/*
+  // Proxy port = 7005 + (slot_number * 10), e.g., node-1 = 7015, node-2 = 7025
+  if (pathname === "/open/v1" || pathname === "/open/v1/" || pathname.startsWith("/open/v1/")) {
+    // Calculate proxy port based on SLOT: 7005 + (slot_number * 10)
+    // node-1 -> 7015, node-2 -> 7025, node-3 -> 7035, etc.
+    const slotMatch = String(SLOT).match(/(\d+)$/);
+    const slotNum = slotMatch ? parseInt(slotMatch[1], 10) : 1;
+    const proxyPort = 7005 + (slotNum * 10);
+    
+    let suffix = pathname.replace(/^\/open\/v1/, "") || "/";
+    if (!suffix.startsWith("/")) suffix = `/${suffix}`;
+    
+    // Ensure path starts with /v1/ for OpenCode Proxy
+    if (!suffix.startsWith("/v1/")) {
+      suffix = `/v1${suffix}`;
+    }
+    
+    const upstreamUrl = `http://127.0.0.1:${proxyPort}${suffix}${parsed.search || ""}`;
+    
+    // Small helper: GET /open/v1/models with free-only filtering for Import.
+    if (suffix.replace(/\/+$/, "") === "/v1/models" && req.method === "GET") {
+      const wantAll = parsed.searchParams.get("all") === "true";
+      const filterFree = wantAll ? false : true; // Default to free-only for OpenCode
+      let upstreamParsed;
+      try {
+        upstreamParsed = new URL(upstreamUrl);
+      } catch (e) {
+        res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad Gateway", message: `Invalid OpenCode Proxy URL: ${e.message}` }));
+        return;
+      }
+      const upstreamReq = http.request(
+        {
+          hostname: upstreamParsed.hostname,
+          port: upstreamParsed.port || proxyPort,
+          path: `${upstreamParsed.pathname}${upstreamParsed.search || ""}`,
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "9Router-OpenCodeChannel/1.0",
+          },
+        },
+        (upstreamRes) => {
+          const chunks = [];
+          upstreamRes.on("data", (c) => chunks.push(c));
+          upstreamRes.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            let payload = null;
+            try {
+              payload = raw ? JSON.parse(raw) : null;
+            } catch {
+              res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Bad Gateway", message: "OpenCode Proxy upstream returned non-JSON for /models." }));
+              return;
+            }
+            // Normalize shapes to OpenAI { data: [{id,...}] } for 9Router Import.
+            let items = [];
+            if (Array.isArray(payload)) items = payload;
+            else if (payload && Array.isArray(payload.data)) items = payload.data;
+            else if (payload && Array.isArray(payload.models)) items = payload.models;
+            const total = items.length;
+            let filtered = items;
+            if (filterFree) {
+              filtered = items.filter((m) => {
+                const id = typeof m === "string" ? m : m && (m.id || m.name || "");
+                return /free/i.test(String(id || ""));
+              });
+            }
+            const data = filtered.map((m) => {
+              if (typeof m === "string") return { id: m, object: "model" };
+              if (m && typeof m === "object") {
+                if (!m.id && m.name) m.id = String(m.name);
+                if (!m.object) m.object = "model";
+                return m;
+              }
+              return { id: String(m), object: "model" };
+            });
+            res.writeHead(upstreamRes.statusCode || 200, {
+              ...CORS_HEADERS,
+              "Content-Type": "application/json; charset=utf-8",
+              "X-OpenCode-Filtered": filterFree ? "free-only" : "all",
+              "X-OpenCode-Total": String(total),
+              "X-OpenCode-Returned": String(data.length),
+            });
+            res.end(JSON.stringify({ object: "list", data }));
+          });
+        });
+        upstreamReq.on("error", (err) => {
+          res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Bad Gateway", message: `OpenCode Proxy /models unreachable: ${err.message}` }));
+        });
+        upstreamReq.end();
+        return;
+      }
+
+    // Generic OpenCode passthrough (chat/completions with SSE streaming, etc.)
+    // No auth replacement needed - OpenCode Proxy handles its own auth
+    let upstreamParsed;
+    try {
+      upstreamParsed = new URL(upstreamUrl);
+    } catch (e) {
+      res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Gateway", message: `Invalid OpenCode Proxy upstream URL: ${e.message}` }));
+      return;
+    }
+    const fwdHeaders = { ...req.headers };
+    delete fwdHeaders.host;
+    delete fwdHeaders["content-length"];
+    // Add OpenCode Proxy API key if configured
+    const proxyApiKey = process.env.OPENCODE_PROXY_API_KEY || "";
+    if (proxyApiKey) {
+      fwdHeaders.authorization = `Bearer ${proxyApiKey}`;
+    }
+    fwdHeaders["user-agent"] = "9Router-OpenCodeChannel/1.0";
+    fwdHeaders.accept = fwdHeaders.accept || "application/json";
+
+    const openCodeReq = http.request(
+      {
+        hostname: upstreamParsed.hostname,
+        port: upstreamParsed.port || proxyPort,
+        path: `${upstreamParsed.pathname}${upstreamParsed.search || ""}`,
+        method: req.method,
+        headers: fwdHeaders,
+      },
+      (openCodeRes) => {
+        const resHeaders = { ...openCodeRes.headers };
+        resHeaders["Access-Control-Allow-Origin"] = "*";
+        res.writeHead(openCodeRes.statusCode, resHeaders);
+        openCodeRes.pipe(res);
+      }
+    );
+    openCodeReq.on("error", (err) => {
+      res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Gateway", message: `OpenCode Proxy upstream unreachable: ${err.message}` }));
+    });
+    req.pipe(openCodeReq);
+    return;
+  }
+
   // 4. Reverse-Proxy ALL other requests to 9Router on TARGET_PORT
   const headers = { ...req.headers };
   headers.host = `127.0.0.1:${TARGET_PORT}`;

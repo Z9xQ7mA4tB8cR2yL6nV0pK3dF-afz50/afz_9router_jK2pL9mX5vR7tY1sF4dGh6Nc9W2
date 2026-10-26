@@ -410,6 +410,55 @@ jobs:
             sleep 1
           done
 
+      - name: "9.5. Deploy & Start OpenCode Proxy"
+        if: steps.lock_check.outputs.locked != 'true'
+        id: start_proxy
+        env:
+          PORT: ${{ steps.node_meta.outputs.port }}
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+        run: |
+          PORT="${{ steps.node_meta.outputs.port }}"
+          SLOT="${{ steps.node_meta.outputs.canonical_slot }}"
+          
+          # Calculate proxy port: 7005 + (slot_number * 10)
+          SLOT_NUM=$(echo "$SLOT" | grep -o -E '[0-9]+' | tail -n 1)
+          PROXY_PORT=$((7005 + SLOT_NUM * 10))
+          
+          echo "[STEP 9.5] Deploying OpenCode Proxy on port $PROXY_PORT for slot $SLOT..."
+          
+          # Create proxy directory
+          mkdir -p /root/opencode-proxy
+          
+          # Copy proxy.mjs from repo
+          cp scripts/proxy.mjs /root/opencode-proxy/proxy.mjs
+          
+          # Start OpenCode server if not running
+          if ! curl -s http://127.0.0.1:4096/v1/models >/dev/null 2>&1; then
+            echo "[INFO] Starting OpenCode server on port 4096..."
+            OPENCODE_SERVER_PASSWORD='test123' opencode serve --port 4096 --hostname 127.0.0.1 &
+            sleep 5
+          fi
+          
+          # Start OpenCode Proxy
+          echo "[INFO] Starting OpenCode Proxy on port $PROXY_PORT..."
+          OPENCODE_PASSWORD='test123' \
+          PORT=$PROXY_PORT \
+          HOST=127.0.0.1 \
+          OPENCODE_URL=http://127.0.0.1:4096 \
+          PROXY_API_KEY="${{ secrets.OPENCODE_PROXY_API_KEY }}" \
+          node /root/opencode-proxy/proxy.mjs >> /tmp/proxy.log 2>&1 &
+          
+          # Wait for proxy to be ready
+          for i in {1..15}; do
+            if curl -s "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1; then
+              echo "[SUCCESS] OpenCode Proxy listening on port $PROXY_PORT! (Attempt $i)"
+              break
+            fi
+            sleep 1
+          done
+          
+          echo "proxy_port=$PROXY_PORT" >> $GITHUB_OUTPUT
+
       - name: "10. Verify Local 9Router Engine and Models"
         if: steps.lock_check.outputs.locked != 'true'
         env:
