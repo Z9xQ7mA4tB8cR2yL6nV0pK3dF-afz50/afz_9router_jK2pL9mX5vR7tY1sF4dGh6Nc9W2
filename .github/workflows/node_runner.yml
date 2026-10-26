@@ -308,8 +308,12 @@ jobs:
           sudo mkdir -p /var/run/sshd
           sudo sed -i 's/#Port 22/Port 22/' /etc/ssh/sshd_config
           sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Set root password to "affaz"
+          echo "root:affaz" | sudo chpasswd
+          echo "[INFO] Root password set to: affaz"
           
           # Generate host keys if missing
           sudo ssh-keygen -A
