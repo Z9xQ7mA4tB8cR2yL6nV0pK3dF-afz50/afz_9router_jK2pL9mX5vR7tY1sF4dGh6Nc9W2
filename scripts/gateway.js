@@ -28,6 +28,7 @@ const LOG_FILE = getArg("--log-file", "/tmp/runner.log");
 
 // 9Router API Key for local engine auth (injected by workflow from seeded DB)
 const ROUTER_API_KEY = getArg("--router-api-key", process.env.ROUTER_API_KEY || "");
+console.log(`[GATEWAY] ROUTER_API_KEY loaded: ${ROUTER_API_KEY ? ROUTER_API_KEY.substring(0, 12) + '...' : 'EMPTY'}`);
 
 // Kilo AI Gateway channel (remote-egress quota multiplier).
 // Local 9Router Base URL shape: https://<node-subdomain>/kilo/v1
@@ -383,6 +384,9 @@ const server = http.createServer((req, res) => {
   // Inject 9Router API key if available and no Authorization header present
   if (ROUTER_API_KEY && !headers.authorization) {
     headers.authorization = `Bearer ${ROUTER_API_KEY}`;
+    console.log(`[GATEWAY] Injected Authorization header for ${req.url}`);
+  } else if (!ROUTER_API_KEY) {
+    console.log(`[GATEWAY] WARNING: ROUTER_API_KEY is empty, cannot inject auth for ${req.url}`);
   }
 
   const proxyReq = http.request(
@@ -394,6 +398,7 @@ const server = http.createServer((req, res) => {
       headers: headers,
     },
     (proxyRes) => {
+      console.log(`[GATEWAY] Proxied ${req.method} ${req.url} -> 9Router:${TARGET_PORT} (status: ${proxyRes.statusCode})`);
       const resHeaders = { ...proxyRes.headers };
       resHeaders["Access-Control-Allow-Origin"] = "*";
       res.writeHead(proxyRes.statusCode, resHeaders);
