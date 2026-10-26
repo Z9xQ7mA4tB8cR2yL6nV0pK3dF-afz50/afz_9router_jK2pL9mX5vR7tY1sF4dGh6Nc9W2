@@ -52,19 +52,16 @@ const slotNum = slotMatch ? parseInt(slotMatch[1], 10) : 1;
 const OPENCODE_PROXY_PORT = 7005 + (slotNum * 10);
 const OPENCODE_PROXY_BASE = `http://127.0.0.1:${OPENCODE_PROXY_PORT}`;
 
-// OpenCode Proxy API Key (for authentication to the proxy)
+// OpenCode serve credentials (for Basic auth to opencode serve at 4096)
+const OPENCODE_USERNAME = process.env.OPENCODE_USERNAME || "opencode";
+const OPENCODE_PASSWORD = process.env.OPENCODE_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD || "test123";
+const OPENCODE_BASIC_AUTH = `Basic ${Buffer.from(`${OPENCODE_USERNAME}:${OPENCODE_PASSWORD}`).toString("base64")}`;
+
+// OpenCode Proxy API Key (for authentication to the proxy at 7015/4097)
 const OPENCODE_PROXY_API_KEY = process.env.OPENCODE_PROXY_API_KEY || "afz26";
 const OPENCODE_PROXY_AUTH = OPENCODE_PROXY_API_KEY
   ? `Bearer ${OPENCODE_PROXY_API_KEY}`
   : "";
-
-// Normalize model name to providerID/modelID (same as original proxy.mjs)
-function normalizeModel(name) {
-  const value = String(name || "opencode/deepseek-v4.1-flash-free").trim()
-  const slash = value.indexOf("/")
-  if (slash === -1) return { providerID: "opencode", modelID: value }
-  return { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) }
-}
 
 // In-memory ring buffer for low latency
 let buffer = [];
@@ -495,8 +492,8 @@ const server = http.createServer((req, res) => {
 return;
       }
 
-    // 3.7.1 OpenCode Chat Completions via Session API: POST /open/v1/chat/completions
-    // Uses opencode server's session API (same as original proxy.mjs)
+    // 3.7.1 OpenCode Chat Completions via Proxy: POST /open/v1/chat/completions
+    // Uses the proxy's chat/completions endpoint (same as direct curl to 7015)
     if (suffix.replace(/\/+$/, "") === "/v1/chat/completions" && req.method === "POST") {
       // Read body first, then handle asynchronously
       let body = "";
@@ -518,93 +515,24 @@ return;
             return res.end(JSON.stringify({ error: "messages array required" }));
           }
 
-          // Build prompt from messages (same as original proxy)
-          const prompt = messages.map(m => `${m.role}: ${m.content}`).join("\n");
-
+          // Forward to OpenCode Proxy's chat/completions endpoint
           try {
-            // Step 1: Create session (same as original proxy.mjs)
-            const query = new URLSearchParams({ directory: "/home/runner/opencode-proxy/sandbox" });
-            const sessionRes = await fetch(`${OPENCODE_PROXY_BASE}/session?${query.toString()}`, {
+            const proxyRes = await fetch(`${OPENCODE_PROXY_BASE}/v1/chat/completions`, {
               method: "POST",
-              headers: { "content-type": "application/json", ...(OPENCODE_PROXY_AUTH ? { authorization: OPENCODE_PROXY_AUTH } : {}) },
-              body: JSON.stringify({ title: "api: " + messages[0]?.content?.slice(0, 60) || "chat" })
-            });
-            const session = await sessionRes.json();
-            const sessionID = session?.id;
-            if (!sessionID) throw new Error("opencode did not return a session id");
-
-            // Step 2: Send prompt to session (same as original proxy)
-            const { providerID, modelID } = normalizeModel(model);
-            let variant = "";
-            if (providerID === "opencode" && /-free$/.test(modelID)) variant = "max";
-
-            const payload = {
-              model: { providerID, modelID },
-              parts: [{ type: "text", text: prompt }],
-            };
-            if (variant) payload.variant = variant;
-
-            await fetch(`${OPENCODE_PROXY_BASE}/session/${sessionID}/prompt_async`, {
-              method: "POST",
-              headers: { "content-type": "application/json", ...(OPENCODE_PROXY_AUTH ? { authorization: OPENCODE_PROXY_AUTH } : {}) },
-              body: JSON.stringify(payload)
+              headers: {
+                "content-type": "application/json",
+                ...(OPENCODE_PROXY_AUTH ? { authorization: OPENCODE_PROXY_AUTH } : {})
+              },
+              body: JSON.stringify({ model, messages })
             });
 
-            // Step 3: Poll for response (same as original proxy)
-            let content = "";
-            const deadline = Date.now() + 120000;
-            let finished = false;
-
-            while (Date.now() < deadline && !finished) {
-              const messagesRes = await fetch(`${OPENCODE_PROXY_BASE}/session/${sessionID}/message`, {
-                headers: OPENCODE_PROXY_AUTH ? { authorization: OPENCODE_PROXY_AUTH } : {}
-              });
-              const messagesOut = await messagesRes.json();
-              const assistants = (messagesOut || []).filter(m => m?.info?.role === "assistant");
-
-              if (assistants.length === 0) {
-                await new Promise(r => setTimeout(r, 350));
-                continue;
-              }
-
-              const fullText = assistants.map(m => (m.parts || []).filter(p => p?.type === "text" && !p.ignored && !p.synthetic).map(p => p.text || "").join("")).join("");
-              const lastInfo = assistants[assistants.length - 1].info;
-
-              if (lastInfo?.error) {
-                throw new Error(lastInfo.error.message || JSON.stringify(lastInfo.error));
-              }
-
-              if (lastInfo?.time?.completed && !lastInfo?.time?.started) {
-                content = fullText;
-                finished = true;
-                break;
-              }
-
-              await new Promise(r => setTimeout(r, 350));
-            }
-
-            if (!finished) throw new Error("OpenCode session timed out");
-
-            // Clean up session
-            try { await fetch(`${OPENCODE_PROXY_BASE}/session/${sessionID}`, { method: "DELETE" }); } catch {}
-
-            // Return OpenAI-compatible response
-            res.writeHead(200, {
+            const data = await proxyRes.json();
+            
+            res.writeHead(proxyRes.status, {
               ...CORS_HEADERS,
               "Content-Type": "application/json; charset=utf-8",
             });
-            res.end(JSON.stringify({
-              id: "chatcmpl-" + Date.now(),
-              object: "chat.completion",
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{
-                index: 0,
-                message: { role: "assistant", content: content.trim() },
-                finish_reason: "stop"
-              }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-            }));
+            res.end(JSON.stringify(data));
 
           } catch (err) {
             console.error("[GATEWAY] OpenCode chat error:", err.message);
