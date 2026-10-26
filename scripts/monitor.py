@@ -482,9 +482,10 @@ def restart_9router_with_proxy(state: NodeSharedState, warp_enabled: bool, redis
     slot = state.slot
     log("WARP", f"Restarting 9Router for {slot} with WARP {'enabled' if warp_enabled else 'disabled'}")
     
-    # Find and kill existing 9Router process
-    run_cmd(["pkill", "-f", "9router"], timeout=5)
-    run_cmd(["pkill", "-f", "server.js"], timeout=5)
+    # Find and kill existing 9Router process (be specific to avoid killing monitor.py)
+    run_cmd(["pkill", "-f", "9router.*server\\.js"], timeout=5)
+    run_cmd(["pkill", "-f", "node.*9router"], timeout=5)
+    run_cmd(["pkill", "-f", "server\\.js"], timeout=5)
     time.sleep(2)
     
     # Prepare environment for 9Router
