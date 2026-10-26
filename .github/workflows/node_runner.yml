@@ -285,6 +285,85 @@ jobs:
             exit 1
           fi
 
+      - name: "7.6. Setup Cloudflare Tunnel SSH Access"
+        if: steps.lock_check.outputs.locked != 'true'
+        id: ssh_tunnel
+        env:
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+        run: |
+          echo "[STEP 7.6] Setting up SSH access via Cloudflare Tunnel..."
+          
+          # Install cloudflared if not present
+          if ! command -v cloudflared &> /dev/null; then
+            echo "[INFO] Installing cloudflared..."
+            sudo mkdir -p --mode=0755 /usr/share/keyrings
+            curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+            sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+          fi
+          
+          # Install and start SSH server
+          echo "[INFO] Installing SSH server..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
+          sudo mkdir -p /var/run/sshd
+          sudo sed -i 's/#Port 22/Port 22/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Generate host keys if missing
+          sudo ssh-keygen -A
+          
+          # Start SSH daemon
+          sudo /usr/sbin/sshd -D &
+          sleep 2
+          
+          # Verify SSH is running
+          if ss -tlnp | grep -q ":22 "; then
+            echo "[SUCCESS] SSH server running on port 22"
+          else
+            echo "[ERROR] SSH server failed to start"
+            exit 1
+          fi
+          
+          # Start cloudflared SSH tunnel in background
+          echo "[INFO] Starting Cloudflare SSH tunnel..."
+          TUNNEL_OUTPUT=$(mktemp)
+          cloudflared access ssh --hostname "${SLOT}-ssh" > "$TUNNEL_OUTPUT" 2>&1 &
+          TUNNEL_PID=$!
+          
+          # Wait for tunnel to be ready and extract URL
+          echo "[INFO] Waiting for tunnel to establish..."
+          for i in {1..30}; do
+            if [ -f "$TUNNEL_OUTPUT" ]; then
+              TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
+              if [ -n "$TUNNEL_URL" ]; then
+                break
+              fi
+            fi
+            sleep 1
+          done
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "[ERROR] Failed to get tunnel URL"
+            cat "$TUNNEL_OUTPUT"
+            exit 1
+          fi
+          
+          # Extract hostname from URL
+          TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
+          
+          echo "[SUCCESS] SSH tunnel established!"
+          echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_OUTPUT
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
+          echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
+          
+          echo "========================================================"
+          echo "  SSH ACCESS READY"
+          echo "  Host: $TUNNEL_HOST"
+          echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@$TUNNEL_HOST"
+          echo "========================================================"
+
       - name: "9. Launch 9Router Engine (Headless Daemon Mode)"
         if: steps.lock_check.outputs.locked != 'true'
         id: start_engine
