@@ -474,8 +474,8 @@ const server = http.createServer((req, res) => {
 return;
       }
 
-    // 3.7.1 OpenCode Chat Completions via CLI: POST /open/v1/chat/completions
-    // Uses `opencode run` CLI since OpenCode server (4096) only serves Web UI
+    // 3.7.1 OpenCode Chat Completions via Session API: POST /open/v1/chat/completions
+    // Uses opencode server's session API (same as original proxy.mjs)
     if (suffix.replace(/\/+$/, "") === "/v1/chat/completions" && req.method === "POST") {
       // Read body first, then handle asynchronously
       let body = "";
@@ -497,56 +497,102 @@ return;
             return res.end(JSON.stringify({ error: "messages array required" }));
           }
 
-          // Build prompt from messages
+          // Build prompt from messages (same as original proxy)
           const prompt = messages.map(m => `${m.role}: ${m.content}`).join("\n");
 
           try {
-            const { spawn } = require("child_process");
-            const child = spawn("opencode", ["run", prompt, "--model", model], {
-              env: { ...process.env, PATH: `${process.env.HOME}/.opencode/bin:${process.env.PATH}` }
+            // Step 1: Create session (same as original proxy.mjs)
+            const query = new URLSearchParams({ directory: "/home/runner/opencode-proxy/sandbox" });
+            const sessionRes = await fetch(`${UPSTREAM}/session?${query.toString()}`, {
+              method: "POST",
+              headers: { "content-type": "application/json", ...(AUTH ? { authorization: AUTH } : {}) },
+              body: JSON.stringify({ title: "api: " + messages[0]?.content?.slice(0, 60) || "chat" })
+            });
+            const session = await sessionRes.json();
+            const sessionID = session?.id;
+            if (!sessionID) throw new Error("opencode did not return a session id");
+
+            // Step 2: Send prompt to session (same as original proxy)
+            const { providerID, modelID } = normalizeModel(model);
+            let variant = "";
+            if (providerID === "opencode" && /-free$/.test(modelID)) variant = "max";
+
+            const payload = {
+              model: { providerID, modelID },
+              parts: [{ type: "text", text: prompt }],
+            };
+            if (variant) payload.variant = variant;
+
+            await fetch(`${UPSTREAM}/session/${sessionID}/prompt_async`, {
+              method: "POST",
+              headers: { "content-type": "application/json", ...(AUTH ? { authorization: AUTH } : {}) },
+              body: JSON.stringify(payload)
             });
 
-            let output = "";
-            let errorOutput = "";
-            child.stdout.on("data", (data) => { output += data.toString(); });
-            child.stderr.on("data", (data) => { errorOutput += data.toString(); });
+            // Step 3: Poll for response (same as original proxy)
+            let content = "";
+            const deadline = Date.now() + 120000;
+            let finished = false;
 
-            child.on("close", (code) => {
-              if (code !== 0) {
-                console.error(`[GATEWAY] opencode run failed (code ${code}): ${errorOutput}`);
-                res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
-                return res.end(JSON.stringify({ error: "OpenCode execution failed", details: errorOutput }));
-              }
-              
-              const content = output.trim();
-              res.writeHead(200, {
-                ...CORS_HEADERS,
-                "Content-Type": "application/json; charset=utf-8",
+            while (Date.now() < deadline && !finished) {
+              const messagesRes = await fetch(`${UPSTREAM}/session/${sessionID}/message`, {
+                headers: AUTH ? { authorization: AUTH } : {}
               });
-              res.end(JSON.stringify({
-                id: "chatcmpl-" + Date.now(),
-                object: "chat.completion",
-                created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [{
-                  index: 0,
-                  message: { role: "assistant", content },
-                  finish_reason: "stop"
-                }],
-                usage: {
-                  prompt_tokens: 0,
-                  completion_tokens: 0,
-                  total_tokens: 0
-                }
-              }));
+              const messagesOut = await messagesRes.json();
+              const assistants = (messagesOut || []).filter(m => m?.info?.role === "assistant");
+
+              if (assistants.length === 0) {
+                await new Promise(r => setTimeout(r, 350));
+                continue;
+              }
+
+              const fullText = assistants.map(m => (m.parts || []).filter(p => p?.type === "text" && !p.ignored && !p.synthetic).map(p => p.text || "").join("")).join("");
+              const lastInfo = assistants[assistants.length - 1].info;
+
+              if (lastInfo?.error) {
+                throw new Error(lastInfo.error.message || JSON.stringify(lastInfo.error));
+              }
+
+              if (lastInfo?.time?.completed && !lastInfo?.time?.started) {
+                content = fullText;
+                finished = true;
+                break;
+              }
+
+              await new Promise(r => setTimeout(r, 350));
+            }
+
+            if (!finished) throw new Error("OpenCode session timed out");
+
+            // Clean up session
+            try { await fetch(`${UPSTREAM}/session/${sessionID}`, { method: "DELETE" }); } catch {}
+
+            // Return OpenAI-compatible response
+            res.writeHead(200, {
+              ...CORS_HEADERS,
+              "Content-Type": "application/json; charset=utf-8",
             });
+            res.end(JSON.stringify({
+              id: "chatcmpl-" + Date.now(),
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{
+                index: 0,
+                message: { role: "assistant", content: content.trim() },
+                finish_reason: "stop"
+              }],
+              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+            }));
+
           } catch (err) {
-            res.writeHead(500, { ...CORS_HEADERS, "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal error", message: err.message }));
+            console.error("[GATEWAY] OpenCode chat error:", err.message);
+            res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "OpenCode execution failed", details: err.message }));
           }
         })();
       });
-      return; // Prevent falling through to generic passthrough
+      return;
     }
 
     // For all other /open/v1/* routes, use generic passthrough
