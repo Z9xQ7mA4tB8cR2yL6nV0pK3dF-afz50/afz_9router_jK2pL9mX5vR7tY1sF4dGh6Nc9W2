@@ -1293,9 +1293,9 @@ def cmd_run_daemon(args):
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    # Initialize 9Router with correct proxy settings based on WARP state
-    log("INIT", "Initializing 9Router with WARP proxy settings...")
-    restart_9router_with_proxy(state, state.warp_enabled, redis_base)
+    # 9Router is already started in Step 9 of workflow.
+    # Only restart when WARP toggle explicitly changes (via command).
+    log("INIT", "9Router already running from workflow Step 9. Skipping restart.")
 
     # Main Thread: Engine Supervisor & Health Monitor Loop
     models_url = f"http://127.0.0.1:{port}/v1/models"
