@@ -295,13 +295,34 @@ jobs:
           opencode --version
           echo "[SUCCESS] OpenCode CLI installed successfully"
 
+      - name: "7.7. Setup OpenCode Proxy Stack (setup.sh)"
+        if: steps.lock_check.outputs.locked != 'true'
+        env:
+          PORT: ${{ steps.node_meta.outputs.port }}
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+        run: |
+          echo "[STEP 7.7] Running setup.sh to install OpenCode Proxy Stack..."
+          SLOT="${{ steps.node_meta.outputs.canonical_slot }}"
+          SLOT_NUM=$(echo "$SLOT" | grep -o -E '[0-9]+' | tail -n 1)
+          PRIMARY_PORT=$((7005 + SLOT_NUM * 10))
+          TEST_PORT=$((4097))
+          SERVE_PORT=4096
+          
+          echo "[INFO] Running setup.sh with ports: serve=4096, primary=$PRIMARY_PORT, test=4097..."
+          sudo bash scripts/setup.sh \
+            --primary-port $PRIMARY_PORT \
+            --test-port 4097 \
+            --serve-port 4096 \
+            --proxy-key afz26 \
+            --model opencode/deepseek-v4.1-flash-free
+
       - name: "7.7. Setup Cloudflare Tunnel SSH Access"
         if: steps.lock_check.outputs.locked != 'true'
         id: ssh_tunnel
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
         run: |
-          echo "[STEP 7.6] Setting up SSH access via Cloudflare Tunnel..."
+          echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel..."
           
           # Install cloudflared if not present
           if ! command -v cloudflared &> /dev/null; then
@@ -416,58 +437,7 @@ jobs:
             if curl -s "http://127.0.0.1:$PORT/gateway-health" >/dev/null 2>&1 || nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
               echo "[SUCCESS] Gateway and 9Router are listening on port $PORT! (Attempt $i)"
               break
-            fi
-            sleep 1
-          done
-
-      - name: "9.5. Deploy & Start OpenCode Proxy"
-        if: steps.lock_check.outputs.locked != 'true'
-        id: start_proxy
-        env:
-          PORT: ${{ steps.node_meta.outputs.port }}
-          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
-        run: |
-          PORT="${{ steps.node_meta.outputs.port }}"
-          SLOT="${{ steps.node_meta.outputs.canonical_slot }}"
-          
-          # Calculate proxy port: 7005 + (slot_number * 10)
-          SLOT_NUM=$(echo "$SLOT" | grep -o -E '[0-9]+' | tail -n 1)
-          PROXY_PORT=$((7005 + SLOT_NUM * 10))
-          
-          echo "[STEP 9.5] Deploying OpenCode Proxy on port $PROXY_PORT for slot $SLOT..."
-          
-          # Create proxy directory (runner user home)
-          mkdir -p /home/runner/opencode-proxy
-          
-          # Copy proxy.mjs from repo
-          cp scripts/proxy.mjs /home/runner/opencode-proxy/proxy.mjs
-          
-          # Start OpenCode server if not running
-          if ! curl -s http://127.0.0.1:4096/v1/models >/dev/null 2>&1; then
-            echo "[INFO] Starting OpenCode server on port 4096..."
-            OPENCODE_SERVER_PASSWORD='test123' opencode serve --port 4096 --hostname 127.0.0.1 &
-            sleep 5
-          fi
-          
-          # Start OpenCode Proxy
-          echo "[INFO] Starting OpenCode Proxy on port $PROXY_PORT..."
-          OPENCODE_PASSWORD='test123' \
-          PORT=$PROXY_PORT \
-          HOST=127.0.0.1 \
-          OPENCODE_URL=http://127.0.0.1:4096 \
-          PROXY_API_KEY="${{ secrets.OPENCODE_PROXY_API_KEY }}" \
-          node /home/runner/opencode-proxy/proxy.mjs >> /tmp/proxy.log 2>&1 &
-          
-          # Wait for proxy to be ready
-          for i in {1..15}; do
-            if curl -s "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1; then
-              echo "[SUCCESS] OpenCode Proxy listening on port $PROXY_PORT! (Attempt $i)"
-              break
-            fi
-            sleep 1
-          done
-          
-          echo "proxy_port=$PROXY_PORT" >> $GITHUB_OUTPUT
+           echo "========================================================"
 
       - name: "10. Verify Local 9Router Engine and Models"
         if: steps.lock_check.outputs.locked != 'true'

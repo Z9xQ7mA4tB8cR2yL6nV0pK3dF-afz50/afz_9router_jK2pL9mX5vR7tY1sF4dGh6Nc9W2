@@ -219,21 +219,43 @@ let modelCache = { at: 0, list: [] }
 
 async function modelList() {
   if (Date.now() - modelCache.at < 60000 && modelCache.list.length) return modelCache.list
-  const providers = await upstream("GET", "/config/providers")
-  const list = []
-  for (const provider of providers?.providers || []) {
-    for (const [modelID, model] of Object.entries(provider.models || {})) {
-      const released = model?.release_date ? Date.parse(model.release_date) : 0
-      list.push({
-        id: `${provider.id}/${modelID}`,
-        object: "model",
-        created: Number.isFinite(released) ? Math.floor(released / 1000) : 0,
-        owned_by: provider.id,
-      })
+  try {
+    const providers = await upstream("GET", "/config/providers")
+    const list = []
+    for (const provider of providers?.providers || []) {
+      for (const [modelID, model] of Object.entries(provider.models || {})) {
+        const released = model?.release_date ? Date.parse(model.release_date) : 0
+        list.push({
+          id: modelID,
+          object: "model",
+          created: Number.isFinite(released) ? Math.floor(released / 1000) : 0,
+          owned_by: provider.id,
+          provider: provider.id,
+        })
+      }
     }
+    if (list.length) modelCache = { at: Date.now(), list }
+    return list.length ? list : modelCache.list
+  } catch (error) {
+    // Keep serving the last known list during a transient upstream failure.
+    if (modelCache.list.length) return modelCache.list
+    throw error
   }
-  modelCache = { at: Date.now(), list }
-  return list
+}
+
+async function defaultModelId() {
+  try {
+    const list = await modelList()
+    if (!list.length) return DEFAULT_MODEL
+    const bare = String(DEFAULT_MODEL).includes("/")
+      ? String(DEFAULT_MODEL).slice(String(DEFAULT_MODEL).indexOf("/") + 1)
+      : String(DEFAULT_MODEL)
+    const exact = list.find((model) => model.id === bare)
+    const chosen = exact || list.find((model) => /-free$/.test(model.id)) || list[0]
+    return `${chosen.provider}/${chosen.id}`
+  } catch {
+    return DEFAULT_MODEL
+  }
 }
 
 class SilentStartError extends Error {}
@@ -248,7 +270,7 @@ async function handleChat(res, body) {
     throw new ProxyError(400, "no text content in messages", "invalid_request_error")
   }
 
-  const requestedModel = String(body.model || DEFAULT_MODEL)
+  const requestedModel = String(body.model || (await defaultModelId()))
   const { providerID, modelID } = normalizeModel(requestedModel)
   if (!providerID || !modelID) {
     throw new ProxyError(400, "invalid model", "invalid_request_error")
@@ -428,6 +450,8 @@ async function handleChat(res, body) {
       if (!finished) await abortSession(sessionID)
       await deleteSession(sessionID)
     }
+
+    if (silentStart) continue
   }
 
   if (closed) return
@@ -437,7 +461,7 @@ async function handleChat(res, body) {
 async function readBody(req) {
   let size = 0
   const chunks = []
-  for (const chunk of req) {
+  for await (const chunk of req) {
     size += chunk.length
     if (size > 2_000_000) throw new ProxyError(413, "request body too large", "invalid_request_error")
     chunks.push(chunk)
@@ -450,15 +474,30 @@ async function readBody(req) {
   }
 }
 
+const TRUST_LOOPBACK = process.env.TRUST_LOOPBACK !== "0"
+
+function isLoopback(req) {
+  const address = req.socket.remoteAddress || ""
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1"
+}
+
 function authorized(req) {
   if (!PROXY_API_KEY) return true
-  return req.headers.authorization === `Bearer ${PROXY_API_KEY}`
+  if (TRUST_LOOPBACK && isLoopback(req)) return true
+  return (
+    req.headers.authorization === `Bearer ${PROXY_API_KEY}` ||
+    req.headers["x-api-key"] === PROXY_API_KEY
+  )
 }
 
 const server = http.createServer(async (req, res) => {
   const started = Date.now()
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`)
   const path = url.pathname
+  const route = path === "/open" ? "/" : path.startsWith("/open/") ? path.slice("/open".length) : path
+  if (process.env.DEBUG_HEADERS === "1") {
+    console.log("DEBUG_HEADERS", req.method, path, req.socket.remoteAddress, JSON.stringify(req.headers))
+  }
   try {
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
@@ -470,11 +509,14 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
-    if (!authorized(req)) {
+    const isHealth = req.method === "GET" && (route === "/health" || route === "/v1/health")
+    const isRoot = req.method === "GET" && (route === "/" || route === "/v1" || route === "/v1/")
+
+    if (!authorized(req) && !isHealth && !isRoot) {
       throw new ProxyError(401, "invalid proxy api key", "authentication_error")
     }
 
-    if (req.method === "GET" && path === "/health") {
+    if (isHealth) {
       let upstreamHealth = null
       try {
         upstreamHealth = await upstream("GET", "/global/health", undefined, 5000)
@@ -492,23 +534,36 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
-    if (req.method === "GET" && path === "/v1/models") {
+    if (req.method === "GET" && (route === "/v1/models" || route === "/models")) {
       const data = await modelList()
       sendJSON(res, 200, { object: "list", data })
       return
     }
 
-    if (req.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions")) {
+    if (
+      req.method === "POST" &&
+      (route === "/v1/chat/completions" ||
+        route === "/chat/completions" ||
+        route === "/v1/chat" ||
+        route === "/chat")
+    ) {
       const body = await readBody(req)
       await handleChat(res, body)
       return
     }
 
-    if (req.method === "GET" && path === "/") {
+    if (req.method === "GET" && (route === "/" || route === "/v1" || route === "/v1/")) {
       sendJSON(res, 200, {
         name: "opencode-openai-proxy",
-        endpoints: ["GET /health", "GET /v1/models", "POST /v1/chat/completions"],
-        model: DEFAULT_MODEL,
+        endpoints: [
+          "GET /health",
+          "GET /v1/models",
+          "POST /v1/chat/completions",
+          "POST /v1/chat",
+        ],
+        models: "GET /v1/models",
+        default_model: DEFAULT_MODEL,
+        port: PORT,
       })
       return
     }
@@ -539,5 +594,11 @@ warmup().finally(() => {
   server.listen(PORT, HOST, () => {
     console.log(`opencode proxy listening on http://${HOST}:${PORT}`)
     console.log(`upstream=${UPSTREAM} model=${DEFAULT_MODEL} variant=${DEFAULT_VARIANT} tools=${TOOLS_MODE}`)
+    if (PROXY_API_KEY && TRUST_LOOPBACK) {
+      console.log("WARN: TRUST_LOOPBACK=1 — loopback requests bypass PROXY_API_KEY")
+    }
+    if (HOST !== "127.0.0.1" && HOST !== "::1" && HOST !== "localhost") {
+      console.log(`WARN: HOST=${HOST} is not loopback — firewall/auth required`)
+    }
   })
 })
