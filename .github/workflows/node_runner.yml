@@ -381,10 +381,6 @@ jobs:
           WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
           WORKER_HANDSHAKE_TOKEN: ${{ steps.fetch_config.outputs.handshake_token }}
           INITIAL_PASSWORD: "affaz26.${{ steps.node_meta.outputs.port }}"
-          ALL_PROXY: "socks5://127.0.0.1:40000"
-          HTTP_PROXY: "http://127.0.0.1:40000"
-          HTTPS_PROXY: "http://127.0.0.1:40000"
-          NO_PROXY: "localhost,127.0.0.1"
         run: |
           PORT="${{ steps.node_meta.outputs.port }}"
           ENGINE_PORT=$((PORT + 500))

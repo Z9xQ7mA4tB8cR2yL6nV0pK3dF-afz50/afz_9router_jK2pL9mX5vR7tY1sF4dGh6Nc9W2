@@ -173,7 +173,7 @@ class NodeSharedState:
         self.active_models_count = 0
         self.warp_ip = "127.0.0.1"
         self.vm_ip = "127.0.0.1"
-        self.warp_enabled = True  # Default: WARP enabled
+        self.warp_enabled = False  # Default: WARP disabled (direct VM IP)
         self.models_list = []
         self.discovered_models = []
         self.providers = []
@@ -371,7 +371,7 @@ class RateLimitDecisionEngine:
         self.consecutive_rl_count = 0
         self.cumulative_wait_sec = 0.0
 
-def toggle_warp(state: NodeSharedState, enable: bool) -> str:
+def toggle_warp(state: NodeSharedState, enable: bool, redis_base: str) -> str:
     """
     Toggle WARP on/off.
     - enable=True: Connect WARP (register, set proxy mode, connect)
@@ -382,7 +382,6 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
     Only updates state for UI consistency.
     """
     # Skip actual WARP management in CI environments (GitHub Actions, etc.)
-    # WARP disconnect breaks network routing in containerized CI runners
     in_ci = os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true"
     
     warp_bin = shutil.which("warp-cli")
@@ -471,7 +470,79 @@ def toggle_warp(state: NodeSharedState, enable: bool) -> str:
         status_msg=f"WARP {'enabled' if enable else 'disabled'}. Egress IP: {fresh_ip}"
     )
     log("WARP", f"WARP {'enabled' if enable else 'disabled'} for {state.slot}. New egress IP: {fresh_ip}")
+    
+    # Restart 9Router with new proxy settings based on WARP state
+    restart_9router_with_proxy(state, enable, redis_base)
+    
     return fresh_ip
+
+
+def restart_9router_with_proxy(state: NodeSharedState, warp_enabled: bool, redis_base: str):
+    """Restart 9Router with appropriate proxy settings based on WARP state."""
+    slot = state.slot
+    log("WARP", f"Restarting 9Router for {slot} with WARP {'enabled' if warp_enabled else 'disabled'}")
+    
+    # Find and kill existing 9Router process
+    run_cmd(["pkill", "-f", "9router"], timeout=5)
+    run_cmd(["pkill", "-f", "server.js"], timeout=5)
+    time.sleep(2)
+    
+    # Prepare environment for 9Router
+    env = os.environ.copy()
+    port = state.port
+    engine_port = port + 500
+    slot_name = state.slot
+    
+    if warp_enabled:
+        # WARP ON: Use WARP SOCKS5 proxy
+        env["ALL_PROXY"] = "socks5://127.0.0.1:40000"
+        env["HTTP_PROXY"] = "http://127.0.0.1:40000"
+        env["HTTPS_PROXY"] = "http://127.0.0.1:40000"
+        env["NO_PROXY"] = "localhost,127.0.0.1"
+        log("WARP", f"Starting 9Router with WARP proxy for {slot_name}")
+    else:
+        # WARP OFF: No proxy - direct connection
+        env.pop("ALL_PROXY", None)
+        env.pop("HTTP_PROXY", None)
+        env.pop("HTTPS_PROXY", None)
+        env.pop("NO_PROXY", None)
+        log("WARP", f"Starting 9Router WITHOUT proxy (direct) for {slot_name}")
+    
+    # Start 9Router
+    router_app_dir = f"{os.path.expanduser('~')}/.npm-global/lib/node_modules/9router/app"
+    if os.path.exists(f"{router_app_dir}/server.js"):
+        log("WARP", f"Starting standalone 9Router server on port {engine_port}")
+        subprocess.Popen(
+            ["node", f"{router_app_dir}/server.js"],
+            env={**env, "PORT": str(engine_port), "HOSTNAME": "0.0.0.0"},
+            stdout=open("/tmp/runner.log", "a"),
+            stderr=subprocess.STDOUT
+        )
+    else:
+        log("WARP", f"Starting 9Router CLI on port {engine_port}")
+        subprocess.Popen(
+            ["9router", "-p", str(engine_port), "-H", "0.0.0.0", "--tray", "-n"],
+            env=env,
+            stdout=open("/tmp/runner.log", "a"),
+            stderr=subprocess.STDOUT
+        )
+    
+    # Wait for 9Router to be ready
+    time.sleep(3)
+    
+    # Verify 9Router is responding
+    for i in range(10):
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"http://127.0.0.1:{engine_port}/v1/models", headers={"User-Agent": "9Router-HealthCheck"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    log("WARP", f"9Router restarted successfully on port {engine_port}")
+                    return
+        except Exception:
+            time.sleep(1)
+    
+    log("WARP_WARN", f"9Router restart verification failed on port {engine_port}")
 
 
 def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "", redis_base: str = None) -> bool:
@@ -865,7 +936,7 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                     elif action == "warp_toggle":
                         enable = cmd.get("enable", True)
                         log("CMD_CONSUMER", f"Executing WARP toggle: enable={enable}")
-                        fresh_ip = toggle_warp(state, enable)
+                        fresh_ip = toggle_warp(state, enable, redis_base)
                         ack_payload["new_ip"] = fresh_ip
                         ack_payload["warp_enabled"] = enable
                         ack_payload["message"] = f"WARP {'enabled' if enable else 'disabled'}. Egress IP: {fresh_ip}"
@@ -1220,6 +1291,10 @@ def cmd_run_daemon(args):
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    # Initialize 9Router with correct proxy settings based on WARP state
+    log("INIT", "Initializing 9Router with WARP proxy settings...")
+    restart_9router_with_proxy(state, state.warp_enabled, redis_base)
 
     # Main Thread: Engine Supervisor & Health Monitor Loop
     models_url = f"http://127.0.0.1:{port}/v1/models"
