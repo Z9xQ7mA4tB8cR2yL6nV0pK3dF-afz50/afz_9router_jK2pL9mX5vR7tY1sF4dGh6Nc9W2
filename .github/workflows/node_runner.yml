@@ -437,7 +437,11 @@ jobs:
             if curl -s "http://127.0.0.1:$PORT/gateway-health" >/dev/null 2>&1 || nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
               echo "[SUCCESS] Gateway and 9Router are listening on port $PORT! (Attempt $i)"
               break
-           echo "========================================================"
+              fi
+              sleep 1
+            done
+            
+            echo "========================================================"
 
       - name: "10. Verify Local 9Router Engine and Models"
         if: steps.lock_check.outputs.locked != 'true'
