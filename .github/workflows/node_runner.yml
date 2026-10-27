@@ -123,6 +123,7 @@ jobs:
           ADMIN_SECRET=$(echo "$RESPONSE" | jq -r '.config.admin_secret // empty')
           WORKER_URL_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.worker_url // empty')
           HANDSHAKE_TOKEN_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.handshake_token // empty')
+          NODE_NAME_FROM_CONFIG=$(echo "$RESPONSE" | jq -r '.name // empty')
           
           if [ -z "$REDIS_BASE" ] || [ "$REDIS_BASE" = "null" ]; then
             echo "[ERROR] REDIS_BASE not returned by Worker"
@@ -130,14 +131,19 @@ jobs:
             exit 1
           fi
           
+          # Use name from NODE_CONFIG if available, else fallback to node_name
+          FINAL_NODE_NAME="${NODE_NAME_FROM_CONFIG:-${{ steps.node_meta.outputs.node_name }}}"
+          
           echo "redis_base=$REDIS_BASE" >> $GITHUB_OUTPUT
           echo "admin_secret=$ADMIN_SECRET" >> $GITHUB_OUTPUT
           echo "worker_url=$WORKER_URL_RECEIVED" >> $GITHUB_OUTPUT
           echo "handshake_token=$HANDSHAKE_TOKEN_RECEIVED" >> $GITHUB_OUTPUT
+          echo "node_name=$FINAL_NODE_NAME" >> $GITHUB_OUTPUT
           
           echo "[SUCCESS] Config fetched from Worker:"
           echo "  - Redis Base: $REDIS_BASE"
           echo "  - Worker URL: $WORKER_URL_RECEIVED"
+          echo "  - Node Name: $FINAL_NODE_NAME"
 
       - name: "6. Pre-Flight Lock Check (Fast Abort) - Using Worker's Redis"
         id: lock_check
