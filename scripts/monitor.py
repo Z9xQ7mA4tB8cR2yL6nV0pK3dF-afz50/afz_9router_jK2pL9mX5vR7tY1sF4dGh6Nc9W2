@@ -37,6 +37,7 @@ import http.server
 import urllib.request
 import urllib.parse
 import urllib.error
+import requests
 
 # Force unbuffered real-time stdout output in CI/CD consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -1159,24 +1160,13 @@ def register_tunnel_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node
     
     try:
         register_url = f"{ssh_worker_url.rstrip('/')}/api/register-model"
-        req = urllib.request.Request(
-            register_url,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                log("R2_REG", f"Tunnel {tunnel_id} registered to R2 ({category})")
-                return True
-            else:
-                err = resp.read().decode()
-                log("R2_REG_WARN", f"Registration failed ({resp.status}): {err}")
-                return False
-    except urllib.error.HTTPError as e:
-        err_msg = e.read().decode() if e.fp else str(e)
-        log("R2_REG_ERR", f"Registration failed ({e.code}): {err_msg}")
-        return False
+        r = requests.post(register_url, json=payload, timeout=10)
+        if r.status_code == 200:
+            log("R2_REG", f"Tunnel {tunnel_id} registered to R2 ({category})")
+            return True
+        else:
+            log("R2_REG_WARN", f"Registration failed ({r.status_code}): {r.text}")
+            return False
     except Exception as e:
         log("R2_REG_ERR", f"Registration error: {e}")
         return False
