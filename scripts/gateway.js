@@ -28,7 +28,7 @@ const LOG_FILE = getArg("--log-file", "/tmp/runner.log");
 
 // 9Router API Key for local engine auth (injected by workflow from seeded DB)
 const ROUTER_API_KEY = getArg("--router-api-key", process.env.ROUTER_API_KEY || "");
-console.log(`[GATEWAY] ROUTER_API_KEY loaded: ${ROUTER_API_KEY ? ROUTER_API_KEY.substring(0, 12) + '...' : 'EMPTY'}`);
+console.log(`[GATEWAY] ROUTER_API_KEY loaded: ${ROUTER_API_KEY ? '[REDACTED]' : 'EMPTY'}`);
 
 // Kilo AI Gateway channel (remote-egress quota multiplier).
 // Local 9Router Base URL shape: https://<node-subdomain>/kilo/v1
@@ -63,7 +63,50 @@ const OPENCODE_PROXY_AUTH = OPENCODE_PROXY_API_KEY
   ? `Bearer ${OPENCODE_PROXY_API_KEY}`
   : "";
 
-// In-memory ring buffer for low latency
+// Helper function to save tunnel URL to R2 via Cloudflare Worker
+async function registerTunnelUrlToR2(tunnelUrl, nodeAlias) {
+  try {
+    const workerUrl = process.env.CF_WORKER_URL || "https://affaz-node-manager.cmt202150.workers.dev";
+    const adminSecret = process.env.ADMIN_SECRET || "affaz26";
+    
+    const payload = {
+      id: `tunnel_${SLOT}`,
+      alias: process.env.NODE_ALIAS || "OpenCode Node",
+      category: "opencode",
+      link: tunnelUrl,
+      endpoints: [],
+      last_seen: Date.now()
+    };
+    
+    const response = await fetch(`${process.env.CF_WORKER_URL || "https://affaz-node-manager.cmt202150.workers.dev"}/api/register-model`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${process.env.ADMIN_SECRET || "affaz26"}`
+      },
+      body: JSON.stringify({
+        id: `tunnel_${SLOT}`,
+        alias: process.env.NODE_ALIAS || "OpenCode Node",
+        category: "opencode",
+        link: tunnelUrl,
+        endpoints: [],
+        secret: process.env.ADMIN_SECRET || "affaz26"
+      })
+    });
+    
+    if (response.ok) {
+      console.log(`[TUNNEL] Saved tunnel URL to R2 for ${SLOT}`);
+      return true;
+    } else {
+      console.error("[TUNNEL] Failed to save to R2:", await response.text());
+      return false;
+    }
+  } catch (err) {
+    console.error("[TUNNEL] Error saving to R2:", err.message);
+    return false;
+  }
+}
+
 let buffer = [];
 let fileOffset = 0;
 const sseClients = new Set();
@@ -631,8 +674,12 @@ return;
   req.pipe(proxyReq);
 });
 
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", async () => {
   console.log(
     `[GATEWAY] Active on port ${PORT} for slot '${SLOT}'. Upstream 9Router: ${TARGET_PORT}. Log file: ${LOG_FILE}`
   );
+  
+  // Register tunnel URL to R2 via Cloudflare Worker
+  const tunnelUrl = process.env.TUNNEL_URL || `https://${SLOT}.${process.env.DOMAIN || "router1.affaz101.eu.cc"}/open/v1/`;
+  await registerTunnelUrlToR2(tunnelUrl, process.env.NODE_ALIAS || "OpenCode Node");
 });

@@ -488,6 +488,44 @@ jobs:
             cat /tmp/cloudflared.log
           fi
 
+      - name: "11.5. Register Tunnel URL with Cloudflare Worker"
+        if: steps.lock_check.outputs.locked != 'true'
+        env:
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
+          WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+        run: |
+          echo "[STEP 11.5] Registering tunnel URL with Cloudflare Worker..."
+          
+          # Extract tunnel URL from cloudflared log
+          TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "[ERROR] Could not extract tunnel URL from cloudflared log"
+            exit 1
+          fi
+          
+          echo "[INFO] Found tunnel URL: $TUNNEL_URL"
+          
+          # Construct the OpenCode endpoint URL
+          OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
+          
+          # Register with Cloudflare Worker
+          RESPONSE=$(curl -s -X POST \
+            -H "content-type: application/json" \
+            -H "authorization: Bearer $ADMIN_SECRET" \
+            -d "{\"id\":\"tunnel_${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"opencode\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[],\"secret\":\"${ADMIN_SECRET}\"}" \
+            "${WORKER_URL}/api/register-model")
+          
+          if echo "$RESPONSE" | grep -q "Node Registered"; then
+            echo "[SUCCESS] Tunnel URL registered with Cloudflare Worker"
+            echo "TUNNEL_URL=$OPENCODE_ENDPOINT" >> $GITHUB_OUTPUT
+          else
+            echo "[ERROR] Failed to register tunnel URL: $RESPONSE"
+            exit 1
+          fi
+
       - name: "12. Launch Telemetry, Authenticated Tunnel Handshake & Lease Daemon"
         if: steps.lock_check.outputs.locked != 'true'
         env:
