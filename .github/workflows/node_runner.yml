@@ -656,10 +656,15 @@ jobs:
           OPENCODE_ENDPOINT="${GW_URL}/open/v1/"
           
           # Register as unified remote node (category=remote -> stored as remote_ prefix in R2)
+          # link = SSH tunnel URL (for nural SSH access)
+          # endpoints[] = both SSH + Gateway (for info)
+          SSH_HOST=$(echo "$SSH_URL" | sed 's|https://||' | sed 's|/||g')
+          SSH_LINK="${SSH_URL}/"
+          
           NODE_SECRET="affaz!2025#1"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
-            -d "{\"id\":\"${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"remote\",\"prefix\":\"remote_\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[${ENDPOINTS}],\"secret\":\"${NODE_SECRET}\"}" \
+            -d "{\"id\":\"${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"remote\",\"prefix\":\"remote_\",\"link\":\"${SSH_LINK}\",\"endpoints\":[${ENDPOINTS}],\"secret\":\"${NODE_SECRET}\"}" \
             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
