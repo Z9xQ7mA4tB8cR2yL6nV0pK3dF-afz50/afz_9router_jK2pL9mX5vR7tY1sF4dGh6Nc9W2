@@ -534,11 +534,11 @@ jobs:
         run: |
           echo "[STEP 11.5] Registering tunnel URL with Cloudflare Worker..."
           
-          # Extract tunnel URL from cloudflared log (try multiple patterns)
+          # Extract tunnel URL from cloudflared log (generic patterns, no hardcoded domains)
           # Pattern 1: Full trycloudflare.com URL in log
           TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
           
-          # Pattern 2: Just hostname in log (e.g., operating-boot-yard-legislative.trycloudflare.com)
+          # Pattern 2: Just hostname in log (e.g., xxx.trycloudflare.com)
           if [ -z "$TUNNEL_URL" ]; then
             TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
             if [ -n "$TUNNEL_HOST" ]; then
@@ -546,9 +546,49 @@ jobs:
             fi
           fi
           
-          # Pattern 3: Custom hostname from ingress config (e.g., router2.affaz101.eu.cc)
+          # Pattern 3: Custom hostname from ingress config (generic, no hardcoded domains)
           if [ -z "$TUNNEL_URL" ]; then
-            # Extract hostname from JSON config in log: "hostname":"router2.affaz101.eu.cc"
+            # Extract hostname from JSON config in log: "hostname":"..."
+            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
+            if [ -n "$TUNNEL_HOST" ]; then
+              TUNNEL_URL="https://$TUNNEL_HOST"
+            fi
+          fi
+          
+          # Pattern 3b: Custom hostname without .trycloudflare.com (custom domain)
+          if [ -z "$TUNNEL_URL" ]; then
+            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            if [ -n "$TUNNEL_HOST" ]; then
+              TUNNEL_URL="https://$TUNNEL_HOST"
+            fi
+          fi
+          
+          # Pattern 3b: Extract hostname from ingress config JSON (generic)
+          if [ -z "$TUNNEL_URL" ]; then
+            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
+            if [ -n "$TUNNEL_HOST" ]; then
+              TUNNEL_URL="https://$TUNNEL_HOST"
+            fi
+          fi
+          
+          # Pattern 3b: Custom hostname without .trycloudflare.com (custom domain)
+          if [ -z "$TUNNEL_URL" ]; then
+            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            if [ -n "$TUNNEL_HOST" ]; then
+              TUNNEL_URL="https://$TUNNEL_HOST"
+            fi
+          fi
+          
+          # Pattern 3b: Extract hostname from ingress config JSON (generic)
+          if [ -z "$TUNNEL_URL" ]; then
+            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
+            if [ -n "$TUNNEL_HOST" ]; then
+              TUNNEL_URL="https://$TUNNEL_HOST"
+            fi
+          fi
+          
+          # Pattern 4: Look for hostname in ingress config JSON (generic)
+          if [ -z "$TUNNEL_URL" ]; then
             TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
             if [ -n "$TUNNEL_HOST" ]; then
               TUNNEL_URL="https://$TUNNEL_HOST"
