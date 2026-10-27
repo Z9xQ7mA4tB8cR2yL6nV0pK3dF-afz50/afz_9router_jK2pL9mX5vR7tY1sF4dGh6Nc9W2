@@ -58,7 +58,7 @@ const OPENCODE_PROXY_BASE = `http://127.0.0.1:${OPENCODE_PROXY_PORT}`;
 async function registerTunnelUrlToR2(tunnelUrl, nodeAlias) {
   try {
     const workerUrl = process.env.CF_WORKER_URL || "https://affaz-node-manager.cmt202150.workers.dev";
-    const adminSecret = process.env.ADMIN_SECRET || "affaz26";
+    const adminSecret = process.env.ADMIN_SECRET || "affaz";
     
     const payload = {
       id: `tunnel_${SLOT}`,
@@ -73,7 +73,7 @@ async function registerTunnelUrlToR2(tunnelUrl, nodeAlias) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "authorization": `Bearer ${process.env.ADMIN_SECRET || "affaz26"}`
+        "authorization": `Bearer ${process.env.ADMIN_SECRET || "affaz"}`
       },
       body: JSON.stringify({
         id: `tunnel_${SLOT}`,
@@ -81,7 +81,7 @@ async function registerTunnelUrlToR2(tunnelUrl, nodeAlias) {
         category: "opencode",
         link: tunnelUrl,
         endpoints: [],
-        secret: process.env.ADMIN_SECRET || "affaz26"
+        secret: process.env.ADMIN_SECRET || "affaz"
       })
     });
     

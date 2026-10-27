@@ -97,14 +97,14 @@ bash /opt/opencode-proxy/status.sh
 
 curl -s http://127.0.0.1:7015/health
 curl -s http://127.0.0.1:7015/open/v1/ | jq .
-curl -s -H 'Authorization: Bearer afz26' \
+curl -s -H 'Authorization: Bearer affaz' \
   http://127.0.0.1:7015/v1/models | jq '.data | length'
 ```
 
 Chat:
 
 ```bash
-curl -s -H 'Authorization: Bearer afz26' \
+curl -s -H 'Authorization: Bearer affaz' \
   -H 'content-type: application/json' \
   http://127.0.0.1:7015/v1/chat/completions \
   -d '{"model":"glm-5.3-flash-free","messages":[{"role":"user","content":"Reply exactly: SETUP_OK"}]}' \
@@ -190,7 +190,7 @@ OPENCODE_URL=http://127.0.0.1:4096
 OPENCODE_USERNAME=opencode
 OPENCODE_SERVER_PASSWORD=$SERVE_PASS
 OPENCODE_PASSWORD=$SERVE_PASS
-PROXY_API_KEY=afz26
+PROXY_API_KEY=affaz
 MODEL=opencode/deepseek-v4.1-flash-free
 VARIANT=max
 TOOLS_MODE=safe
@@ -324,10 +324,10 @@ cannot start duplicate proxies.
 ```bash
 curl -s http://127.0.0.1:7015/health | jq .
 curl -s http://127.0.0.1:7015/open/v1/ | jq .
-curl -s -H 'Authorization: Bearer afz26' \
+curl -s -H 'Authorization: Bearer affaz' \
   http://127.0.0.1:7015/v1/models | jq '.data | length'
 
-curl -s -H 'Authorization: Bearer afz26' \
+curl -s -H 'Authorization: Bearer affaz' \
   -H 'content-type: application/json' \
   http://127.0.0.1:7015/v1/chat/completions \
   -d '{"model":"glm-5.3-flash-free","messages":[{"role":"user","content":"Reply exactly: MANUAL_OK"}]}' \
@@ -478,11 +478,11 @@ if (auth !== `Bearer ${env.PROXY_API_KEY}`) {
 // ... existing forward to 7015 ...
 ```
 
-Alternative: make the router forward `Authorization: Bearer afz26` (or
-`x-api-key: afz26`) and set `TRUST_LOOPBACK=0` for 7015, then restart. The
+Alternative: make the router forward `Authorization: Bearer affaz` (or
+`x-api-key: affaz`) and set `TRUST_LOOPBACK=0` for 7015, then restart. The
 router must forward the header on both `/v1/models` and chat.
 
-If password is not important to you, leaving `PROXY_API_KEY=afz26` is fine for
+If password is not important to you, leaving `PROXY_API_KEY=affaz` is fine for
 local use, but the public URL remains usable by anyone who knows it until the
 edge enforces auth.
 
@@ -492,7 +492,7 @@ edge enforces auth.
 
 | Symptom | Check | Fix |
 |---|---|---|
-| `invalid proxy api key` | Is the request loopback? Is `TRUST_LOOPBACK` right? | Send `Authorization: Bearer afz26`; or use 7015 for loopback/router |
+| `invalid proxy api key` | Is the request loopback? Is `TRUST_LOOPBACK` right? | Send `Authorization: Bearer affaz`; or use 7015 for loopback/router |
 | `upstream unreachable` / 502 | `curl -u opencode:PASS http://127.0.0.1:4096/global/health` | `bash /opt/opencode-proxy/start.sh`; check serve log |
 | Models list empty / `/config/providers` 500 | serve cwd must be `/home/opencode`, not `/root` | `cd /home/opencode` before `opencode serve`; `start.sh` already does this |
 | Chat hangs on `/open/v1/chat/completions` | Proxy log has no POST entry | Router intercepts that path; use `/open/v1/chat` |
@@ -507,7 +507,7 @@ Windows `cmd` example with a body file:
 ```cmd
 curl -X POST "https://router1.affaz101.eu.cc/open/v1/chat" ^
   -H "Content-Type: application/json" ^
-  -H "Authorization: Bearer afz26" ^
+  -H "Authorization: Bearer affaz" ^
   --data-binary "@body.json"
 ```
 

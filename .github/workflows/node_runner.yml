@@ -172,7 +172,7 @@ jobs:
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
           REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
-          INITIAL_PASSWORD: "affaz26.${{ steps.node_meta.outputs.port }}"
+          INITIAL_PASSWORD: "affaz.${{ steps.node_meta.outputs.port }}"
         run: |
           echo "[STEP 8] Running SQLite Seeder..."
           python3 scripts/seed_db.py
@@ -306,7 +306,7 @@ jobs:
             --primary-port $PRIMARY_PORT \
             --test-port 4097 \
             --serve-port 4096 \
-            --proxy-key afz26 \
+            --proxy-key affaz \
             --model opencode/deepseek-v4.1-flash-free
             
       - name: "7.7. Setup Cloudflare Tunnel SSH Access + Register to Worker"
@@ -316,7 +316,7 @@ jobs:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          NODE_SECRET: ${{ secrets.NODE_SECRET }}
         run: |
           echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel + registering to Worker..."
           
@@ -338,9 +338,9 @@ jobs:
           sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
           
-          # Set root password to "affaz26" (matching new node standard)
-          echo "root:affaz26" | sudo chpasswd
-          echo "[INFO] Root password set to: affaz26"
+          # Set root password to "affaz" (standardized)
+          echo "root:affaz" | sudo chpasswd
+          echo "[INFO] Root password set to: [REDACTED]"
           
           # Generate host keys if missing
           sudo ssh-keygen -A
@@ -392,16 +392,16 @@ jobs:
           echo "  Host: $TUNNEL_HOST"
           echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@$TUNNEL_HOST"
           echo "  Or direct: ssh root@$TUNNEL_HOST (if cloudflared running locally)"
-          echo "  Password: affaz26"
+          echo "  Password: [REDACTED]"
           echo "========================================================"
           
           # Register SSH tunnel to Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
+          # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
           echo "[INFO] Registering SSH tunnel to Worker..."
           SSH_ENDPOINT="${TUNNEL_URL}/"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
-            -H "authorization: Bearer $ADMIN_SECRET" \
-            -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_ENDPOINT}\",\"endpoints\":[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"}],\"secret\":\"${ADMIN_SECRET}\"}" \
+            -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_ENDPOINT}\",\"endpoints\":[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"}],\"secret\":\"${NODE_SECRET}\"}" \
             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
@@ -422,7 +422,7 @@ jobs:
           REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
           WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
           WORKER_HANDSHAKE_TOKEN: ${{ steps.fetch_config.outputs.handshake_token }}
-          INITIAL_PASSWORD: "affaz26.${{ steps.node_meta.outputs.port }}"
+          INITIAL_PASSWORD: "affaz.${{ steps.node_meta.outputs.port }}"
         run: |
           PORT="${{ steps.node_meta.outputs.port }}"
           ENGINE_PORT=$((PORT + 500))
@@ -525,7 +525,7 @@ jobs:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          NODE_SECRET: ${{ secrets.NODE_SECRET }}
           TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
         run: |
           echo "[STEP 11.5] Registering Gateway tunnel to Worker as OpenCode endpoint..."
@@ -540,10 +540,10 @@ jobs:
           
           # Register with Cloudflare Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
           # category=opencode -> stored as tunnel_ prefix in R2
+          # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
-            -H "authorization: Bearer $ADMIN_SECRET" \
-            -d "{\"id\":\"tunnel_${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"opencode\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[],\"secret\":\"${ADMIN_SECRET}\"}" \
+            -d "{\"id\":\"tunnel_${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"opencode\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[],\"secret\":\"${NODE_SECRET}\"}" \
             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
