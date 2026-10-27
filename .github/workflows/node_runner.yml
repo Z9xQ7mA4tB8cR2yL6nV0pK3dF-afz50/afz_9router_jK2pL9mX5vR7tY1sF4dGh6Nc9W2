@@ -576,7 +576,7 @@ jobs:
         if: steps.lock_check.outputs.locked != 'true'
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
-          NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
+          NODE_NAME: ${{ steps.fetch_config.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
           SSH_TUNNEL_URL: ${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}
           GATEWAY_TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
@@ -626,7 +626,7 @@ jobs:
         if: steps.lock_check.outputs.locked != 'true'
         env:
           NODE: ${{ steps.node_meta.outputs.canonical_slot }}
-          NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
+          NODE_NAME: ${{ steps.fetch_config.outputs.node_name }}
           PORT: ${{ steps.node_meta.outputs.port }}
           RUN_ID: ${{ steps.node_meta.outputs.run_id }}
           REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
