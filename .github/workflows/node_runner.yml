@@ -277,21 +277,6 @@ jobs:
             warp-cli --accept-tos status
             exit 1
           fi
-            if echo "$PROXY_TEST" | grep -q '"origin"'; then
-              PROXY_IP=$(echo "$PROXY_TEST" | grep -o '"origin": "[^"]*"' | cut -d'"' -f4)
-              echo "[SUCCESS] SOCKS5 proxy working! Egress IP via WARP: $PROXY_IP"
-              break
-            fi
-            echo "[RETRY $i/5] SOCKS5 proxy not ready, waiting..."
-            sleep 3
-          done
-          
-          if ! echo "$PROXY_TEST" | grep -q '"origin"'; then
-            echo "[ERROR] SOCKS5 proxy verification FAILED after 5 attempts!"
-            echo "[ERROR] WARP proxy on port 40000 is not functional. Check warp-svc status."
-            warp-cli --accept-tos status
-            exit 1
-          fi
 
       - name: "7.6. Install OpenCode CLI"
         if: steps.lock_check.outputs.locked != 'true'
