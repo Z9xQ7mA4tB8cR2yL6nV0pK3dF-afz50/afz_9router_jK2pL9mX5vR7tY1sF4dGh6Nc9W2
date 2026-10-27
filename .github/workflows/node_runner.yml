@@ -399,6 +399,7 @@ jobs:
           # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
           echo "[INFO] Registering SSH tunnel to Worker..."
           SSH_ENDPOINT="${TUNNEL_URL}/"
+          NODE_SECRET="affaz!2025#1"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
             -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_ENDPOINT}\",\"endpoints\":[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"}],\"secret\":\"${NODE_SECRET}\"}" \
@@ -525,7 +526,6 @@ jobs:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          NODE_SECRET: ${{ secrets.NODE_SECRET }}
           TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
         run: |
           echo "[STEP 11.5] Registering Gateway tunnel to Worker as OpenCode endpoint..."
@@ -541,6 +541,7 @@ jobs:
           # Register with Cloudflare Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
           # category=opencode -> stored as tunnel_ prefix in R2
           # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
+          NODE_SECRET="affaz!2025#1"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
             -d "{\"id\":\"tunnel_${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"opencode\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[],\"secret\":\"${NODE_SECRET}\"}" \
