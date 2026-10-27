@@ -1140,7 +1140,7 @@ def register_tunnel_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node
     else:
         category = "opencode"
         tunnel_id = f"tunnel_{slot}"
-        alias = node_name
+        alias = node_name  # Poetic name from NODE_CONFIG
         endpoints = []
     
     # Construct endpoint URL
