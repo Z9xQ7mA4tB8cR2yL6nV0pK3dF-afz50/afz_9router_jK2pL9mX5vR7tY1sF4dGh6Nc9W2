@@ -343,8 +343,8 @@ jobs:
           sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
           
           # Set root password to "affaz"
-          echo "root:affaz" | sudo chpasswd
-          echo "[INFO] Root password set to: affaz"
+          echo "root:***" | sudo chpasswd
+          echo "[INFO] Root password set to: ***"
           
           # Generate host keys if missing
           sudo ssh-keygen -A
@@ -398,9 +398,9 @@ jobs:
           
           echo "========================================================"
           echo "  SSH ACCESS READY"
-          echo "  Host: $TUNNEL_HOST"
-          echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@$TUNNEL_HOST"
-          echo "  Or direct: ssh root@$TUNNEL_HOST (if cloudflared running locally)"
+          echo "  Host: ***"
+          echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@***"
+          echo "  Or direct: ssh root@*** (if cloudflared running locally)"
           echo "========================================================"
 
       - name: "9. Launch 9Router Engine (Headless Daemon Mode)"
@@ -499,7 +499,16 @@ jobs:
           echo "[STEP 11.5] Registering tunnel URL with Cloudflare Worker..."
           
           # Extract tunnel URL from cloudflared log (try multiple patterns)
+          # Pattern 1: Full URL in log
           TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+          
+          # Pattern 2: Just hostname in log (e.g., operating-boot-yard-legislative.trycloudflare.com)
+          if [ -z "$TUNNEL_URL" ]; then
+            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            if [ -n "$TUNNEL_HOST" ]; then
+              TUNNEL_URL="https://$TUNNEL_HOST"
+            fi
+          fi
           
           # Fallback: try cloudflared API
           if [ -z "$TUNNEL_URL" ]; then
