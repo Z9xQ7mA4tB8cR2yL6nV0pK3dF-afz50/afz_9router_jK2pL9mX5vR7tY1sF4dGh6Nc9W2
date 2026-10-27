@@ -199,35 +199,27 @@ jobs:
       - name: "7.5. Setup Cloudflare WARP (Local SOCKS5 Proxy Mode on 127.0.0.1:40000)"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[STEP 7.5] Installing Cloudflare WARP client..."
-          # Add timeout and retry for apt operations
-          sudo mkdir -p --mode=0755 /usr/share/keyrings
-          curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          # Retry apt-get update with timeout
-          for i in {1..3}; do
-            if sudo apt-get update -qq; then break; fi
-            echo "[RETRY $i/3] apt-get update failed, retrying..."
-            sleep 5
-          done
-          # Install with timeout and retry
-          for i in {1..3}; do
-            if sudo apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" cloudflare-warp; then break; fi
-            echo "[RETRY $i/3] apt-get install failed, retrying..."
-            sleep 5
-          done
-
+          echo "[STEP 7.5] Installing Cloudflare WARP client (direct .deb download)..."
+          
+          # Download WARP .deb directly from Cloudflare (bypasses slow apt repo)
+          WARP_DEB_URL="https://pkg.cloudflareclient.com/pool/main/c/cloudflare-warp/cloudflare-warp_2025.12.0-1_amd64.deb"
+          echo "[INFO] Downloading WARP from $WARP_DEB_URL"
+          curl -fsSL --max-time 60 "$WARP_DEB_URL" -o /tmp/cloudflare-warp.deb
+          
+          # Install with dpkg (no apt update needed)
+          sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
+          
           echo "[INFO] Ensuring warp-svc daemon is active..."
           sudo systemctl start warp-svc 2>/dev/null || sudo service warp-svc start 2>/dev/null || true
           sleep 2
-
+          
           echo "[INFO] Registering WARP client..."
           warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || true
-
+          
           echo "[INFO] Configuring WARP in SOCKS5 Proxy mode (preventing routing conflicts with cloudflared)..."
           warp-cli --accept-tos mode proxy
           warp-cli --accept-tos proxy port 40000 2>/dev/null || true
-
+          
           echo "[INFO] Connecting to Cloudflare WARP edge..."
           # Add timeout to prevent hanging
           timeout 60 warp-cli --accept-tos connect || echo "[WARN] WARP connect timed out, continuing..."
@@ -241,7 +233,7 @@ jobs:
             fi
             sleep 1
           done
-
+          
           echo "[INFO] Testing WARP SOCKS5 egress IP..."
           curl -s --socks5 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=' || echo "[WARN] Trace check skipped."
           
@@ -264,14 +256,6 @@ jobs:
             warp-cli --accept-tos status
             exit 1
           fi
-
-          echo "[INFO] Testing WARP SOCKS5 egress IP..."
-          curl -s --socks5 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=' || echo "[WARN] Trace check skipped."
-          
-          # Verify SOCKS5 proxy actually works for HTTP requests
-          echo "[INFO] Verifying SOCKS5 proxy for HTTP requests..."
-          for i in {1..5}; do
-            PROXY_TEST=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://httpbin.org/ip 2>/dev/null || echo "FAILED")
             if echo "$PROXY_TEST" | grep -q '"origin"'; then
               PROXY_IP=$(echo "$PROXY_TEST" | grep -o '"origin": "[^"]*"' | cut -d'"' -f4)
               echo "[SUCCESS] SOCKS5 proxy working! Egress IP via WARP: $PROXY_IP"
