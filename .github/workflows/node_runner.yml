@@ -159,43 +159,10 @@ jobs:
             echo "=================================================="
           fi
 
-      - name: "7. Claim Lock & Fetch Tunnel Token"
-        if: steps.lock_check.outputs.locked != 'true'
-        id: claim_tunnel
-        env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
-          WORKER_HANDSHAKE_TOKEN: ${{ secrets.WORKER_HANDSHAKE_TOKEN }}
-          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
-          RUN_ID: ${{ steps.node_meta.outputs.run_id }}
-        run: |
-          echo "[STEP 7] Claiming lock and fetching tunnel token..."
-          
-          # Claim lock with --force (takeover if needed) - must pass run_id to claim lock
-          python3 scripts/monitor.py check-lock --slot "$SLOT" --force --run-id "$RUN_ID" --redis-base "${{ steps.fetch_config.outputs.redis_base }}"
-          
-          # Now lock exists, call tunnel-claim
-          RESPONSE=$(curl -s -X POST \
-            -H "x-handshake-token: $WORKER_HANDSHAKE_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"run_id": "'$RUN_ID'"}' \
-            "$WORKER_URL/api/node/$SLOT/tunnel-claim")
-          
-          echo "Tunnel Claim Response: $RESPONSE"
-          
-          TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
-          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-            echo "[ERROR] Failed to get tunnel token"
-            echo "$RESPONSE" | jq .
-            exit 1
-          fi
-          
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
-          echo "[SUCCESS] Tunnel token acquired: ${TOKEN:0:20}..."
-
       - name: "8. Install 9Router CLI"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[STEP 6] Installing 9Router globally via npm..."
+          echo "[STEP 8] Installing 9Router globally via npm..."
           npm install -g 9router
           echo "[INFO] 9Router root: $(npm root -g)/9router"
 
@@ -352,13 +319,16 @@ jobs:
             --proxy-key afz26 \
             --model opencode/deepseek-v4.1-flash-free
             
-      - name: "7.7. Setup Cloudflare Tunnel SSH Access"
+      - name: "7.7. Setup Cloudflare Tunnel SSH Access + Register to Worker"
         if: steps.lock_check.outputs.locked != 'true'
         id: ssh_tunnel
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
+          WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
         run: |
-          echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel..."
+          echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel + registering to Worker..."
           
           # Install cloudflared if not present
           if ! command -v cloudflared &> /dev/null; then
@@ -378,9 +348,9 @@ jobs:
           sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
           
-          # Set root password to "affaz"
-          echo "root:affaz" | sudo chpasswd
-          echo "[INFO] Root password set to: affaz"
+          # Set root password to "affaz26" (matching new node standard)
+          echo "root:affaz26" | sudo chpasswd
+          echo "[INFO] Root password set to: affaz26"
           
           # Generate host keys if missing
           sudo ssh-keygen -A
@@ -432,18 +402,27 @@ jobs:
           echo "  Host: $TUNNEL_HOST"
           echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@$TUNNEL_HOST"
           echo "  Or direct: ssh root@$TUNNEL_HOST (if cloudflared running locally)"
+          echo "  Password: affaz26"
           echo "========================================================"
+          
+          # Register SSH tunnel to Worker (like check/ pattern)
+          echo "[INFO] Registering SSH tunnel to Worker..."
+          SSH_ENDPOINT="${TUNNEL_URL}/"
+          RESPONSE=$(curl -s -X POST \
+            -H "content-type: application/json" \
+            -H "authorization: Bearer $ADMIN_SECRET" \
+            -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_ENDPOINT}\",\"endpoints\":[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"}],\"secret\":\"${ADMIN_SECRET}\"}" \
+            "${WORKER_URL}/api/register-model")
+          
+          if echo "$RESPONSE" | grep -q "Node Registered"; then
+            echo "[SUCCESS] SSH tunnel registered with Worker"
+          else
+            echo "[WARN] Failed to register SSH tunnel: $RESPONSE"
+          fi
           
           echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_OUTPUT
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
-          
-          echo "========================================================"
-          echo "  SSH ACCESS READY"
-          echo "  Host: ***"
-          echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@***"
-          echo "  Or direct: ssh root@*** (if cloudflared running locally)"
-          echo "========================================================"
 
       - name: "9. Launch 9Router Engine (Headless Daemon Mode)"
         if: steps.lock_check.outputs.locked != 'true'
@@ -504,120 +483,72 @@ jobs:
             echo "[INFO] Response received from models endpoint."
           fi
 
-      - name: "10. Install Cloudflare Tunnel Client (cloudflared)"
+      - name: "11. Start Cloudflare Quick Tunnel for Gateway (Port 6001)"
         if: steps.lock_check.outputs.locked != 'true'
-        run: |
-          echo "[STEP 10] Installing Cloudflare Tunnel daemon (cloudflared)..."
-          sudo mkdir -p --mode=0755 /usr/share/keyrings
-          curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
-          echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
-          echo "[SUCCESS] cloudflared $(cloudflared --version) installed and ready for authenticated handshake."
-
-      - name: "11. Start Cloudflare Tunnel (with claimed token)"
-        if: steps.lock_check.outputs.locked != 'true'
+        id: gateway_tunnel
         env:
-          TUNNEL_TOKEN: ${{ steps.claim_tunnel.outputs.token }}
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          PORT: ${{ steps.node_meta.outputs.port }}
         run: |
-          echo "[STEP 11] Starting Cloudflare Tunnel..."
-          nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
-          echo $! > /tmp/cloudflared.pid
-          sleep 3
-          if curl -s --max-time 5 "http://127.0.0.1:4040/api/tunnels" | grep -q "healthy"; then
-            echo "[SUCCESS] Cloudflare Tunnel is running"
-          else
-            echo "[WARN] Tunnel may still be starting, check /tmp/cloudflared.log"
-            cat /tmp/cloudflared.log
+          echo "[STEP 11] Starting Cloudflare quick tunnel for Gateway (port $PORT)..."
+          
+          # Start cloudflared quick tunnel for Gateway HTTP port
+          TUNNEL_OUTPUT=$(mktemp)
+          cloudflared tunnel --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
+          TUNNEL_PID=$!
+          
+          # Wait for tunnel to be ready and extract URL
+          echo "[INFO] Waiting for gateway tunnel to establish..."
+          for i in {1..30}; do
+            if [ -f "$TUNNEL_OUTPUT" ]; then
+              TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
+              if [ -n "$TUNNEL_URL" ]; then
+                break
+              fi
+            fi
+            sleep 1
+          done
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "[ERROR] Failed to get gateway tunnel URL"
+            cat "$TUNNEL_OUTPUT"
+            exit 1
           fi
+          
+          TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
+          
+          echo "[SUCCESS] Gateway tunnel established!"
+          echo "========================================================"
+          echo "  GATEWAY TUNNEL READY"
+          echo "  Host: $TUNNEL_HOST"
+          echo "  URL: $TUNNEL_URL"
+          echo "  Gateway Port: $PORT"
+          echo "========================================================"
 
-      - name: "11.5. Register Tunnel URL with Cloudflare Worker"
+          echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_OUTPUT
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
+          echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
+
+      - name: "11.5. Register Gateway Tunnel to Worker (OpenCode Endpoint)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
         run: |
-          echo "[STEP 11.5] Registering tunnel URL with Cloudflare Worker..."
-          
-          # Extract tunnel URL from cloudflared log (generic patterns, no hardcoded domains)
-          # Pattern 1: Full trycloudflare.com URL in log
-          TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
-          
-          # Pattern 2: Just hostname in log (e.g., xxx.trycloudflare.com)
-          if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
-            if [ -n "$TUNNEL_HOST" ]; then
-              TUNNEL_URL="https://$TUNNEL_HOST"
-            fi
-          fi
-          
-          # Pattern 3: Custom hostname from ingress config (generic, no hardcoded domains)
-          if [ -z "$TUNNEL_URL" ]; then
-            # Extract hostname from JSON config in log: "hostname":"..."
-            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
-            if [ -n "$TUNNEL_HOST" ]; then
-              TUNNEL_URL="https://$TUNNEL_HOST"
-            fi
-          fi
-          
-          # Pattern 3b: Custom hostname without .trycloudflare.com (custom domain)
-          if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
-            if [ -n "$TUNNEL_HOST" ]; then
-              TUNNEL_URL="https://$TUNNEL_HOST"
-            fi
-          fi
-          
-          # Pattern 3b: Extract hostname from ingress config JSON (generic)
-          if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
-            if [ -n "$TUNNEL_HOST" ]; then
-              TUNNEL_URL="https://$TUNNEL_HOST"
-            fi
-          fi
-          
-          # Pattern 3b: Custom hostname without .trycloudflare.com (custom domain)
-          if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
-            if [ -n "$TUNNEL_HOST" ]; then
-              TUNNEL_URL="https://$TUNNEL_HOST"
-            fi
-          fi
-          
-          # Pattern 3b: Extract hostname from ingress config JSON (generic)
-          if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
-            if [ -n "$TUNNEL_HOST" ]; then
-              TUNNEL_URL="https://$TUNNEL_HOST"
-            fi
-          fi
-          
-          # Pattern 4: Look for hostname in ingress config JSON (generic)
-          if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
-            if [ -n "$TUNNEL_HOST" ]; then
-              TUNNEL_URL="https://$TUNNEL_HOST"
-            fi
-          fi
-          
-          # Fallback: try cloudflared API
-          if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_URL=$(curl -s --max-time 5 "http://127.0.0.1:4040/api/tunnels" | grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -1)
-          fi
+          echo "[STEP 11.5] Registering Gateway tunnel to Worker as OpenCode endpoint..."
           
           if [ -z "$TUNNEL_URL" ]; then
-            echo "[ERROR] Could not extract tunnel URL from cloudflared log"
-            cat /tmp/cloudflared.log
+            echo "[ERROR] No tunnel URL from gateway_tunnel step"
             exit 1
           fi
-          
-          echo "[INFO] Found tunnel URL: $TUNNEL_URL"
           
           # Construct the OpenCode endpoint URL
           OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
           
-          # Register with Cloudflare Worker
+          # Register with Cloudflare Worker (category=opencode -> stored as tunnel_ prefix in R2)
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
             -H "authorization: Bearer $ADMIN_SECRET" \
@@ -625,14 +556,14 @@ jobs:
             "${WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
-            echo "[SUCCESS] Tunnel URL registered with Cloudflare Worker"
-            echo "TUNNEL_URL=$OPENCODE_ENDPOINT" >> $GITHUB_OUTPUT
+            echo "[SUCCESS] Gateway tunnel registered with Worker as OpenCode endpoint"
+            echo "OPENCODE_ENDPOINT=$OPENCODE_ENDPOINT" >> $GITHUB_OUTPUT
           else
-            echo "[ERROR] Failed to register tunnel URL: $RESPONSE"
+            echo "[ERROR] Failed to register gateway tunnel: $RESPONSE"
             exit 1
           fi
 
-      - name: "12. Launch Telemetry, Authenticated Tunnel Handshake & Lease Daemon"
+      - name: "12. Launch Telemetry & Lease Daemon"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           NODE: ${{ steps.node_meta.outputs.canonical_slot }}
@@ -641,14 +572,13 @@ jobs:
           RUN_ID: ${{ steps.node_meta.outputs.run_id }}
           REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
           WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
-          WORKER_HANDSHAKE_TOKEN: ${{ steps.fetch_config.outputs.handshake_token }}
           PYTHONUNBUFFERED: "1"
           ALL_PROXY: "socks5://127.0.0.1:40000"
           HTTP_PROXY: "http://127.0.0.1:40000"
           HTTPS_PROXY: "http://127.0.0.1:40000"
           NO_PROXY: "localhost,127.0.0.1"
         run: |
-          echo "[STEP 12] Running 2-Key Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
+          echo "[STEP 12] Running Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
           python3 -u scripts/monitor.py run \
             --slot "$NODE" \
             --name "$NODE_NAME" \
@@ -656,8 +586,7 @@ jobs:
             --run-id "$RUN_ID" \
             --gh-run-id "${{ github.run_id }}" \
             --redis-base "$REDIS_BASE" \
-            --worker-url "$WORKER_URL" \
-            --handshake-token "$WORKER_HANDSHAKE_TOKEN"
+            --worker-url "$WORKER_URL"
 
       - name: "12. Safe Clean Up on Exit (Compare-and-Delete)"
         if: always()

@@ -1239,9 +1239,11 @@ def cmd_run_daemon(args):
     log("INIT", f"Initial heartbeat registered in Redis.")
 
     # Dynamic Security Handshake: Claim Cloudflare Tunnel from Worker after Heartbeat is active in Redis
-    worker_url = getattr(args, "worker_url", None) or os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev")
-    handshake_token = getattr(args, "handshake_token", None) or os.environ.get("WORKER_HANDSHAKE_TOKEN", "")
-    claim_and_start_tunnel(worker_url, handshake_token, slot, run_id, port, gh_run_id)
+    # SKIPPED: Quick tunnels are now created in GitHub Actions workflow (Step 11)
+    # worker_url = getattr(args, "worker_url", None) or os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev")
+    # handshake_token = getattr(args, "handshake_token", None) or os.environ.get("WORKER_HANDSHAKE_TOKEN", "")
+    # claim_and_start_tunnel(worker_url, handshake_token, slot, run_id, port, gh_run_id)
+    log("INIT", "Skipping tunnel claim - using quick tunnels from workflow Step 11")
 
     # Initialize Rate Limit & WARP Decision Matrix Engine
     rl_engine = RateLimitDecisionEngine(boot_timestamp)
@@ -1531,7 +1533,6 @@ def main():
     p_run.add_argument("--api-key", help="9Router master API key")
     p_run.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
     p_run.add_argument("--worker-url", default=os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev"), help="Cloudflare Worker base URL")
-    p_run.add_argument("--handshake-token", default=os.environ.get("WORKER_HANDSHAKE_TOKEN", ""), help="Handshake token for claiming Cloudflare tunnel")
 
     # Subcommand: test-rl-matrix
     subparsers.add_parser("test-rl-matrix", help="Run automated test suite for RateLimitDecisionEngine")

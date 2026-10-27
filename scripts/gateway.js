@@ -52,16 +52,7 @@ const slotNum = slotMatch ? parseInt(slotMatch[1], 10) : 1;
 const OPENCODE_PROXY_PORT = 7005 + (slotNum * 10);
 const OPENCODE_PROXY_BASE = `http://127.0.0.1:${OPENCODE_PROXY_PORT}`;
 
-// OpenCode serve credentials (for Basic auth to opencode serve at 4096)
-const OPENCODE_USERNAME = process.env.OPENCODE_USERNAME || "opencode";
-const OPENCODE_PASSWORD = process.env.OPENCODE_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD || "test123";
-const OPENCODE_BASIC_AUTH = `Basic ${Buffer.from(`${OPENCODE_USERNAME}:${OPENCODE_PASSWORD}`).toString("base64")}`;
-
-// OpenCode Proxy API Key (for authentication to the proxy at 7015/4097)
-const OPENCODE_PROXY_API_KEY = process.env.OPENCODE_PROXY_API_KEY || "afz26";
-const OPENCODE_PROXY_AUTH = OPENCODE_PROXY_API_KEY
-  ? `Bearer ${OPENCODE_PROXY_API_KEY}`
-  : "";
+// In-memory ring buffer for low latency
 
 // Helper function to save tunnel URL to R2 via Cloudflare Worker
 async function registerTunnelUrlToR2(tunnelUrl, nodeAlias) {
@@ -588,26 +579,21 @@ return;
     }
 
     // For all other /open/v1/* routes, use generic passthrough
-    // Generic OpenCode passthrough (chat/completions with SSE streaming, etc.)
-    // No auth replacement needed - OpenCode Proxy handles its own auth
-    let upstreamParsed;
-    try {
-      upstreamParsed = new URL(upstreamUrl);
-    } catch (e) {
-      res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Bad Gateway", message: `Invalid OpenCode Proxy upstream URL: ${e.message}` }));
-      return;
-    }
-    const fwdHeaders = { ...req.headers };
-    delete fwdHeaders.host;
-    delete fwdHeaders["content-length"];
-    // Add OpenCode Proxy API key if configured
-    const proxyApiKey = process.env.OPENCODE_PROXY_API_KEY || "";
-    if (proxyApiKey) {
-      fwdHeaders.authorization = `Bearer ${proxyApiKey}`;
-    }
-    fwdHeaders["user-agent"] = "9Router-OpenCodeChannel/1.0";
-    fwdHeaders.accept = fwdHeaders.accept || "application/json";
+// For all other /open/v1/* routes, use generic passthrough
+      // No auth replacement needed - OpenCode Proxy handles its own auth (none needed)
+      let upstreamParsed;
+      try {
+        upstreamParsed = new URL(upstreamUrl);
+      } catch (e) {
+        res.writeHead(502, { ...CORS_HEADERS, "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad Gateway", message: `Invalid OpenCode Proxy upstream URL: ${e.message}` }));
+        return;
+      }
+      const fwdHeaders = { ...req.headers };
+      delete fwdHeaders.host;
+      delete fwdHeaders["content-length"];
+      fwdHeaders["user-agent"] = "9Router-OpenCodeChannel/1.0";
+      fwdHeaders.accept = fwdHeaders.accept || "application/json";
 
     const openCodeReq = http.request(
       {
@@ -679,7 +665,7 @@ server.listen(PORT, "0.0.0.0", async () => {
     `[GATEWAY] Active on port ${PORT} for slot '${SLOT}'. Upstream 9Router: ${TARGET_PORT}. Log file: ${LOG_FILE}`
   );
   
-  // Register tunnel URL to R2 via Cloudflare Worker
-  const tunnelUrl = process.env.TUNNEL_URL || `https://${SLOT}.${process.env.DOMAIN || "router1.affaz101.eu.cc"}/open/v1/`;
+// Register tunnel URL to R2 via Cloudflare Worker
+  const tunnelUrl = process.env.TUNNEL_URL || `https://${SLOT}.${process.env.DOMAIN || "example.com"}/open/v1/`;
   await registerTunnelUrlToR2(tunnelUrl, process.env.NODE_ALIAS || "OpenCode Node");
 });
