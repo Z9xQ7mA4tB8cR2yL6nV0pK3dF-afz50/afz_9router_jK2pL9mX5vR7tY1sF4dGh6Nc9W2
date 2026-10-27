@@ -499,7 +499,7 @@ jobs:
           echo "[STEP 11.5] Registering tunnel URL with Cloudflare Worker..."
           
           # Extract tunnel URL from cloudflared log (try multiple patterns)
-          # Pattern 1: Full URL in log (https://xxx.trycloudflare.com)
+          # Pattern 1: Full trycloudflare.com URL in log
           TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
           
           # Pattern 2: Just hostname in log (e.g., operating-boot-yard-legislative.trycloudflare.com)
@@ -510,9 +510,10 @@ jobs:
             fi
           fi
           
-          # Pattern 3: Just hostname without .trycloudflare.com (rare)
+          # Pattern 3: Custom hostname from ingress config (e.g., router2.affaz101.eu.cc)
           if [ -z "$TUNNEL_URL" ]; then
-            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            # Extract hostname from JSON config in log: "hostname":"router2.affaz101.eu.cc"
+            TUNNEL_HOST=$(grep -o '"hostname":"[^"]*"' /tmp/cloudflared.log | head -1 | cut -d'"' -f4)
             if [ -n "$TUNNEL_HOST" ]; then
               TUNNEL_URL="https://$TUNNEL_HOST"
             fi
