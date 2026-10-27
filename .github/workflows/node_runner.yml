@@ -201,10 +201,27 @@ jobs:
         run: |
           echo "[STEP 7.5] Installing Cloudflare WARP client (direct .deb download)..."
           
-          # Download WARP .deb directly from Cloudflare (bypasses slow apt repo)
-          WARP_DEB_URL="https://pkg.cloudflareclient.com/pool/main/c/cloudflare-warp/cloudflare-warp_2025.12.0-1_amd64.deb"
-          echo "[INFO] Downloading WARP from $WARP_DEB_URL"
-          curl -fsSL --max-time 60 "$WARP_DEB_URL" -o /tmp/cloudflare-warp.deb
+          # Fetch latest WARP .deb URL from Cloudflare GitHub releases
+          echo "[INFO] Fetching latest WARP release..."
+          LATEST_URL=$(curl -fsSL --max-time 30 https://api.github.com/repos/cloudflare/cloudflared/releases/latest 2>/dev/null | grep -oE '"browser_download_url":\s*"[^"]*cloudflare-warp[^"]*_amd64\.deb"' | head -1 | cut -d'"' -f4)
+          
+          # Fallback: try cloudflareclient.com package listing
+          if [ -z "$LATEST_URL" ]; then
+            echo "[INFO] Trying Cloudflare package index..."
+            LATEST_URL=$(curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/dists/$(lsb_release -cs)/main/binary-amd64/Packages 2>/dev/null | grep -A5 "Package: cloudflare-warp" | grep "Filename:" | head -1 | sed 's/Filename: //' | sed 's|^|https://pkg.cloudflareclient.com/|')
+          fi
+          
+          # Final fallback: known working version pattern
+          if [ -z "$LATEST_URL" ]; then
+            echo "[WARN] Using fallback version..."
+            LATEST_URL="https://pkg.cloudflareclient.com/pool/main/c/cloudflare-warp/cloudflare-warp_2025.10.0-1_amd64.deb"
+          fi
+          
+          echo "[INFO] Downloading WARP from $LATEST_URL"
+          curl -fsSL --max-time 60 "$LATEST_URL" -o /tmp/cloudflare-warp.deb || {
+            echo "[ERROR] Failed to download WARP"
+            exit 1
+          }
           
           # Install with dpkg (no apt update needed)
           sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
