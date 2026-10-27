@@ -587,7 +587,41 @@ jobs:
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
 
-      - name: "11.5. Register Remote Node to Worker (Unified Entry)"
+      - name: "11.5. Register SSH Tunnel to Worker (for nural SSH access)"
+        if: steps.lock_check.outputs.locked != 'true'
+        env:
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          NODE_NAME: ${{ steps.fetch_config.outputs.node_name }}
+          SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
+          SSH_TUNNEL_URL: ${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}
+        run: |
+          echo "[STEP 11.5] Registering SSH tunnel to Worker (for nural)..."
+          
+          SSH_URL="${SSH_TUNNEL_URL}"
+          
+          if [ -z "$SSH_URL" ]; then
+            echo "[ERROR] No SSH tunnel URL"
+            exit 1
+          fi
+          
+          SSH_HOST=$(echo "$SSH_URL" | sed 's|https://||' | sed 's|/||g')
+          
+          # Register SSH tunnel separately (category=ssh -> tunnel_ prefix)
+          # This is what nural expects for SSH access
+          NODE_SECRET="affaz!2025#1"
+          RESPONSE=$(curl -s -X POST \
+            -H "content-type: application/json" \
+            -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_URL}/\",\"endpoints\":[{\"port\":22,\"s\":\"${SSH_HOST}\"}],\"secret\":\"${NODE_SECRET}\"}" \
+            "${SSH_WORKER_URL}/api/register-model")
+          
+          if echo "$RESPONSE" | grep -q "Node Registered"; then
+            echo "[SUCCESS] SSH tunnel registered for nural access"
+          else
+            echo "[ERROR] Failed to register SSH tunnel: $RESPONSE"
+            exit 1
+          fi
+
+      - name: "11.6. Register Unified Remote Node to Worker (OpenCode + combined)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
@@ -597,7 +631,7 @@ jobs:
           GATEWAY_TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
-          echo "[STEP 11.5] Registering unified remote node to Worker..."
+          echo "[STEP 11.6] Registering unified remote node to Worker..."
           
           SSH_URL="${SSH_TUNNEL_URL}"
           GW_URL="${GATEWAY_TUNNEL_URL}"
@@ -622,7 +656,6 @@ jobs:
           OPENCODE_ENDPOINT="${GW_URL}/open/v1/"
           
           # Register as unified remote node (category=remote -> stored as remote_ prefix in R2)
-          # File name: remote_node-3.json
           NODE_SECRET="affaz!2025#1"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
