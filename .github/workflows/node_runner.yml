@@ -205,32 +205,30 @@ jobs:
       - name: "7.5. Setup Cloudflare WARP (Local SOCKS5 Proxy Mode on 127.0.0.1:40000)"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[STEP 7.5] Installing Cloudflare WARP client..."
+          echo "[STEP 7.5] Installing Cloudflare WARP client (direct .deb - fast & reliable)..."
           
-          # Use apt with strict timeouts (original working approach)
-          sudo mkdir -p --mode=0755 /usr/share/keyrings
-          curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          # Try direct .deb download FIRST (bypasses slow/flaky apt repo)
+          echo "[INFO] Fetching latest WARP .deb from Cloudflare package index..."
+          DEB_URL=$(curl -fsSL --max-time 30 "https://pkg.cloudflareclient.com/dists/$(lsb_release -cs)/main/binary-amd64/Packages" 2>/dev/null | grep -A5 "Package: cloudflare-warp" | grep "Filename:" | head -1 | sed 's/Filename: //' | sed 's|^|https://pkg.cloudflareclient.com/|')
           
-          # Single apt-get update with timeout
-          echo "[INFO] Updating package list (timeout 60s)..."
-          timeout 60 sudo apt-get update -qq || {
-            echo "[WARN] apt-get update timed out, trying direct .deb fallback..."
-            # Fallback: try to find working .deb from package index
-            DEB_URL=$(curl -fsSL --max-time 30 "https://pkg.cloudflareclient.com/dists/$(lsb_release -cs)/main/binary-amd64/Packages" 2>/dev/null | grep -A5 "Package: cloudflare-warp" | grep "Filename:" | head -1 | sed 's/Filename: //' | sed 's|^|https://pkg.cloudflareclient.com/|')
-            if [ -n "$DEB_URL" ]; then
-              echo "[INFO] Downloading WARP from $DEB_URL"
-              curl -fsSL --max-time 60 "$DEB_URL" -o /tmp/cloudflare-warp.deb
-              sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
-            else
-              echo "[ERROR] Could not find WARP package"
+          if [ -n "$DEB_URL" ]; then
+            echo "[INFO] Downloading WARP from $DEB_URL"
+            curl -fsSL --max-time 60 "$DEB_URL" -o /tmp/cloudflare-warp.deb
+            sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
+            echo "[SUCCESS] WARP installed via direct .deb"
+          else
+            echo "[WARN] Could not fetch .deb URL, falling back to apt..."
+            
+            # Fallback: apt with strict timeouts
+            sudo mkdir -p --mode=0755 /usr/share/keyrings
+            curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+            
+            timeout 60 sudo apt-get update -qq || {
+              echo "[ERROR] apt-get update failed"
               exit 1
-            fi
-          }
-          
-          # Install warp if not already installed via fallback
-          if ! command -v warp-cli &> /dev/null; then
-            echo "[INFO] Installing cloudflare-warp..."
+            }
+            
             timeout 120 sudo apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" cloudflare-warp || {
               echo "[ERROR] WARP install failed"
               exit 1
