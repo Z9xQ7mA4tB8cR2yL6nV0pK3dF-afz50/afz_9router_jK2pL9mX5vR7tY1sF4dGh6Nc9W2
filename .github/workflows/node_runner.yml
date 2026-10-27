@@ -145,25 +145,41 @@ jobs:
           echo "  - Worker URL: $WORKER_URL_RECEIVED"
           echo "  - Node Name: $FINAL_NODE_NAME"
 
-      - name: "6. Pre-Flight Lock Check (Fast Abort) - Using Worker's Redis"
+      - name: "6. Pre-Flight Lock Check (Wait for Lock or Force) - Using Worker's Redis"
         id: lock_check
+        env:
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
+          echo "[STEP 6] Waiting for lock on slot $SLOT..."
+          
+          # If force=true, use --force to claim lock immediately
           FORCE_FLAG=""
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+          if [ "$FORCE" = "true" ]; then
             FORCE_FLAG="--force"
-            echo "[INFO] Force override enabled! Bypassing lock check."
+            echo "[INFO] Force override enabled! Claiming lock immediately."
+          else
+            echo "[INFO] Waiting for lock to clear (max 5 minutes)..."
           fi
           
-          echo "[STEP 6] Pre-flight checking lock for slot ${{ steps.node_meta.outputs.canonical_slot }} using Worker's Redis..."
-          if python3 scripts/monitor.py check-lock --slot "${{ steps.node_meta.outputs.canonical_slot }}" --redis-base "${{ steps.fetch_config.outputs.redis_base }}" $FORCE_FLAG; then
-            echo "locked=false" >> $GITHUB_OUTPUT
-          else
-            echo "locked=true" >> $GITHUB_OUTPUT
-            echo "=================================================="
-            echo "  [ABORT] Active lock detected for ${{ steps.node_meta.outputs.canonical_slot }}."
-            echo "  Duplicate run terminated cleanly without changes."
-            echo "=================================================="
-          fi
+          # Wait up to 5 minutes for lock to clear
+          for i in {1..30}; do
+            if python3 scripts/monitor.py check-lock --slot "$SLOT" --redis-base "$REDIS_BASE" $FORCE_FLAG; then
+              echo "locked=false" >> $GITHUB_OUTPUT
+              echo "[SUCCESS] Lock acquired or slot free!"
+              break
+            fi
+            
+            if [ $i -eq 30 ]; then
+              echo "locked=true" >> $GITHUB_OUTPUT
+              echo "[ERROR] Lock still held after 5 minutes. Use force=true to override."
+              exit 1
+            fi
+            
+            echo "[WAIT $i/30] Lock held by another run, waiting 10s..."
+            sleep 10
+          done
 
       - name: "8. Install 9Router CLI"
         if: steps.lock_check.outputs.locked != 'true'
