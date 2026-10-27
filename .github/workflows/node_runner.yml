@@ -578,7 +578,11 @@ jobs:
             --run-id "$RUN_ID" \
             --gh-run-id "${{ github.run_id }}" \
             --redis-base "$REDIS_BASE" \
-            --worker-url "$WORKER_URL"
+            --worker-url "$WORKER_URL" \
+            --ssh-worker-url "https://affaz-ssh.cmt202150.workers.dev" \
+            --node-secret "affaz!2025#1" \
+            --ssh-tunnel-url "${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}" \
+            --gateway-tunnel-url "${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}"
 
       - name: "12. Safe Clean Up on Exit (Compare-and-Delete)"
         if: always()

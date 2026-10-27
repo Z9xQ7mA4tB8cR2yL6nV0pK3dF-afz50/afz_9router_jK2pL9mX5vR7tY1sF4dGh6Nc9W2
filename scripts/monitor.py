@@ -1106,7 +1106,7 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
             if token:
                 cloudflared_bin = shutil.which("cloudflared")
                 if cloudflared_bin:
-                    log("TUNNEL", f"Security Handshake SUCCESS! Launching Cloudflare Tunnel for {slot} (Port {port})...")
+                    log("TUNNEL", f"Security Handshake SUCCESS! Launching Cloudflare Tunnel for {slot} (Port {port})....")
                     cmd = [cloudflared_bin, "tunnel", "--no-autoupdate", "run", "--token", token]
                     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     log("TUNNEL", f"Cloudflare Tunnel active and connected in background!")
@@ -1119,6 +1119,68 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
         log("TUNNEL_ERR", f"Tunnel handshake failed ({e.code}): {err_msg}")
     except Exception as e:
         log("TUNNEL_ERR", f"Tunnel handshake error: {e}")
+
+
+def register_tunnel_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node_name: str, port: int, tunnel_url: str):
+    """
+    Register tunnel to ssh-cf-worker R2 via /api/register-model.
+    Called periodically to keep R2 last_seen fresh (prevents scheduled cleanup).
+    """
+    if not ssh_worker_url or not tunnel_url:
+        return False
+    
+    # Determine category and prefix based on port
+    # Port 22 = SSH, Port 6001/6002 = OpenCode Gateway
+    if port == 22:
+        category = "ssh"
+        tunnel_id = f"tunnel_{slot}-ssh"
+        alias = f"{node_name}-SSH"
+        endpoints = [{"port": 22, "s": tunnel_url.replace("https://", "").replace("/", "")}]
+    else:
+        category = "opencode"
+        tunnel_id = f"tunnel_{slot}"
+        alias = node_name
+        endpoints = []
+    
+    # Construct endpoint URL
+    if category == "opencode":
+        endpoint_url = f"{tunnel_url}/open/v1/"
+    else:
+        endpoint_url = f"{tunnel_url}/"
+    
+    payload = {
+        "id": tunnel_id,
+        "alias": alias,
+        "category": category,
+        "link": endpoint_url,
+        "endpoints": endpoints,
+        "secret": node_secret
+    }
+    
+    try:
+        register_url = f"{ssh_worker_url.rstrip('/')}/api/register-model"
+        req = urllib.request.Request(
+            register_url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                log("R2_REG", f"Tunnel {tunnel_id} registered to R2 ({category})")
+                return True
+            else:
+                err = resp.read().decode()
+                log("R2_REG_WARN", f"Registration failed ({resp.status}): {err}")
+                return False
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode() if e.fp else str(e)
+        log("R2_REG_ERR", f"Registration failed ({e.code}): {err_msg}")
+        return False
+    except Exception as e:
+        log("R2_REG_ERR", f"Registration error: {e}")
+        return False
+
 
 def stream_sync_worker(state: NodeSharedState, redis_base: str):
     """
@@ -1302,10 +1364,27 @@ def cmd_run_daemon(args):
     # Main Thread: Engine Supervisor & Health Monitor Loop
     models_url = f"http://127.0.0.1:{port}/v1/models"
 
+    # R2 Re-registration tracking
+    ssh_tunnel_url = getattr(args, "ssh_tunnel_url", None) or os.environ.get("SSH_TUNNEL_URL", "")
+    gateway_tunnel_url = getattr(args, "gateway_tunnel_url", None) or os.environ.get("GATEWAY_TUNNEL_URL", "")
+    ssh_worker_url = getattr(args, "ssh_worker_url", None) or os.environ.get("SSH_WORKER_URL", "https://affaz-ssh.cmt202150.workers.dev")
+    node_secret = getattr(args, "node_secret", None) or os.environ.get("NODE_SECRET", "affaz!2025#1")
+    last_r2_register = 0
+    R2_REGISTER_INTERVAL = 30  # seconds
+
     while True:
         snap = state.get_snapshot()
         if not snap["is_running"]:
             break
+
+        # Periodic R2 re-registration to keep last_seen fresh (every 30s)
+        current_time = time.time()
+        if current_time - last_r2_register >= R2_REGISTER_INTERVAL:
+            if ssh_tunnel_url:
+                register_tunnel_to_r2(ssh_worker_url, node_secret, slot, node_name, 22, ssh_tunnel_url)
+            if gateway_tunnel_url:
+                register_tunnel_to_r2(ssh_worker_url, node_secret, slot, node_name, port, gateway_tunnel_url)
+            last_r2_register = current_time
 
         # Check Local 9Router Engine Health via Bearer Auth
         is_healthy = False
@@ -1533,6 +1612,10 @@ def main():
     p_run.add_argument("--api-key", help="9Router master API key")
     p_run.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
     p_run.add_argument("--worker-url", default=os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev"), help="Cloudflare Worker base URL")
+    p_run.add_argument("--ssh-worker-url", default=os.environ.get("SSH_WORKER_URL", "https://affaz-ssh.cmt202150.workers.dev"), help="SSH Cloudflare Worker URL for R2 registration")
+    p_run.add_argument("--node-secret", default=os.environ.get("NODE_SECRET", "affaz!2025#1"), help="Secret for R2 registration (matches ssh-cf-worker NODE_SECRET)")
+    p_run.add_argument("--ssh-tunnel-url", default=os.environ.get("SSH_TUNNEL_URL", ""), help="SSH tunnel URL (e.g. https://xxx.trycloudflare.com)")
+    p_run.add_argument("--gateway-tunnel-url", default=os.environ.get("GATEWAY_TUNNEL_URL", ""), help="Gateway tunnel URL (e.g. https://xxx.trycloudflare.com)")
 
     # Subcommand: test-rl-matrix
     subparsers.add_parser("test-rl-matrix", help="Run automated test suite for RateLimitDecisionEngine")
