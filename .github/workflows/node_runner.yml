@@ -499,10 +499,18 @@ jobs:
           echo "[STEP 11.5] Registering tunnel URL with Cloudflare Worker..."
           
           # Extract tunnel URL from cloudflared log (try multiple patterns)
-          # Pattern 1: Full URL in log
+          # Pattern 1: Full URL in log (https://xxx.trycloudflare.com)
           TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
           
           # Pattern 2: Just hostname in log (e.g., operating-boot-yard-legislative.trycloudflare.com)
+          if [ -z "$TUNNEL_URL" ]; then
+            TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            if [ -n "$TUNNEL_HOST" ]; then
+              TUNNEL_URL="https://$TUNNEL_HOST"
+            fi
+          fi
+          
+          # Pattern 3: Just hostname without .trycloudflare.com (rare)
           if [ -z "$TUNNEL_URL" ]; then
             TUNNEL_HOST=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
             if [ -n "$TUNNEL_HOST" ]; then
