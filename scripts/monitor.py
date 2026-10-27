@@ -37,7 +37,6 @@ import http.server
 import urllib.request
 import urllib.parse
 import urllib.error
-import requests
 
 # Force unbuffered real-time stdout output in CI/CD consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -1127,6 +1126,7 @@ def register_tunnel_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node
     Register tunnel to ssh-cf-worker R2 via /api/register-model.
     Called periodically to keep R2 last_seen fresh (prevents scheduled cleanup).
     """
+    import requests
     if not ssh_worker_url or not tunnel_url:
         return False
     
