@@ -199,32 +199,37 @@ jobs:
       - name: "7.5. Setup Cloudflare WARP (Local SOCKS5 Proxy Mode on 127.0.0.1:40000)"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[STEP 7.5] Installing Cloudflare WARP client (direct .deb download)..."
+          echo "[STEP 7.5] Installing Cloudflare WARP client..."
           
-          # Fetch latest WARP .deb URL from Cloudflare GitHub releases
-          echo "[INFO] Fetching latest WARP release..."
-          LATEST_URL=$(curl -fsSL --max-time 30 https://api.github.com/repos/cloudflare/cloudflared/releases/latest 2>/dev/null | grep -oE '"browser_download_url":\s*"[^"]*cloudflare-warp[^"]*_amd64\.deb"' | head -1 | cut -d'"' -f4)
+          # Use apt with strict timeouts (original working approach)
+          sudo mkdir -p --mode=0755 /usr/share/keyrings
+          curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           
-          # Fallback: try cloudflareclient.com package listing
-          if [ -z "$LATEST_URL" ]; then
-            echo "[INFO] Trying Cloudflare package index..."
-            LATEST_URL=$(curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/dists/$(lsb_release -cs)/main/binary-amd64/Packages 2>/dev/null | grep -A5 "Package: cloudflare-warp" | grep "Filename:" | head -1 | sed 's/Filename: //' | sed 's|^|https://pkg.cloudflareclient.com/|')
-          fi
-          
-          # Final fallback: known working version pattern
-          if [ -z "$LATEST_URL" ]; then
-            echo "[WARN] Using fallback version..."
-            LATEST_URL="https://pkg.cloudflareclient.com/pool/main/c/cloudflare-warp/cloudflare-warp_2025.10.0-1_amd64.deb"
-          fi
-          
-          echo "[INFO] Downloading WARP from $LATEST_URL"
-          curl -fsSL --max-time 60 "$LATEST_URL" -o /tmp/cloudflare-warp.deb || {
-            echo "[ERROR] Failed to download WARP"
-            exit 1
+          # Single apt-get update with timeout
+          echo "[INFO] Updating package list (timeout 60s)..."
+          timeout 60 sudo apt-get update -qq || {
+            echo "[WARN] apt-get update timed out, trying direct .deb fallback..."
+            # Fallback: try to find working .deb from package index
+            DEB_URL=$(curl -fsSL --max-time 30 "https://pkg.cloudflareclient.com/dists/$(lsb_release -cs)/main/binary-amd64/Packages" 2>/dev/null | grep -A5 "Package: cloudflare-warp" | grep "Filename:" | head -1 | sed 's/Filename: //' | sed 's|^|https://pkg.cloudflareclient.com/|')
+            if [ -n "$DEB_URL" ]; then
+              echo "[INFO] Downloading WARP from $DEB_URL"
+              curl -fsSL --max-time 60 "$DEB_URL" -o /tmp/cloudflare-warp.deb
+              sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
+            else
+              echo "[ERROR] Could not find WARP package"
+              exit 1
+            fi
           }
           
-          # Install with dpkg (no apt update needed)
-          sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
+          # Install warp if not already installed via fallback
+          if ! command -v warp-cli &> /dev/null; then
+            echo "[INFO] Installing cloudflare-warp..."
+            timeout 120 sudo apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" cloudflare-warp || {
+              echo "[ERROR] WARP install failed"
+              exit 1
+            }
+          fi
           
           echo "[INFO] Ensuring warp-svc daemon is active..."
           sudo systemctl start warp-svc 2>/dev/null || sudo service warp-svc start 2>/dev/null || true
@@ -238,7 +243,6 @@ jobs:
           warp-cli --accept-tos proxy port 40000 2>/dev/null || true
           
           echo "[INFO] Connecting to Cloudflare WARP edge..."
-          # Add timeout to prevent hanging
           timeout 60 warp-cli --accept-tos connect || echo "[WARN] WARP connect timed out, continuing..."
           
           # Short wait for tunnel establishment
