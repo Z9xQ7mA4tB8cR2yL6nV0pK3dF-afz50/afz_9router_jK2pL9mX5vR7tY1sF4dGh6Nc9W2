@@ -1172,6 +1172,62 @@ def register_tunnel_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node
         return False
 
 
+def register_remote_node_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node_name: str, port: int, ssh_tunnel_url: str, gateway_tunnel_url: str):
+    """
+    Register unified remote node to ssh-cf-worker R2 with prefix 'remote_'.
+    Single entry combining SSH + Gateway endpoints.
+    File name: remote_node-3.json
+    """
+    import requests
+    if not ssh_worker_url or not gateway_tunnel_url:
+        return False
+    
+    # Unified remote node entry
+    tunnel_id = slot  # e.g., "node-3"
+    alias = node_name  # Poetic name from NODE_CONFIG
+    category = "remote"
+    prefix = "remote_"
+    
+    # Build endpoints array with both SSH and Gateway
+    endpoints = []
+    
+    # SSH endpoint (port 22)
+    if ssh_tunnel_url:
+        ssh_host = ssh_tunnel_url.replace("https://", "").replace("/", "")
+        endpoints.append({"port": 22, "s": ssh_host})
+    
+    # Gateway endpoint (port 6001/6002/6003)
+    if gateway_tunnel_url:
+        gateway_host = gateway_tunnel_url.replace("https://", "").replace("/", "")
+        endpoints.append({"port": port, "s": gateway_host})
+    
+    # Main link is the gateway tunnel for OpenCode access
+    endpoint_url = f"{gateway_tunnel_url}/open/v1/"
+    
+    payload = {
+        "id": tunnel_id,
+        "alias": alias,
+        "category": category,
+        "prefix": prefix,
+        "link": endpoint_url,
+        "endpoints": endpoints,
+        "secret": node_secret
+    }
+    
+    try:
+        register_url = f"{ssh_worker_url.rstrip('/')}/api/register-model"
+        r = requests.post(register_url, json=payload, timeout=10)
+        if r.status_code == 200:
+            log("R2_REG", f"Remote node {tunnel_id} registered to R2 (prefix: {prefix}) with {len(endpoints)} endpoints")
+            return True
+        else:
+            log("R2_REG_WARN", f"Registration failed ({r.status_code}): {r.text}")
+            return False
+    except Exception as e:
+        log("R2_REG_ERR", f"Registration error: {e}")
+        return False
+
+
 def stream_sync_worker(state: NodeSharedState, redis_base: str):
     """
     Deprecated: Real-time logs are streamed directly via gateway.js True SSE (/logs?stream=true).
@@ -1370,10 +1426,10 @@ def cmd_run_daemon(args):
         # Periodic R2 re-registration to keep last_seen fresh (every 30s)
         current_time = time.time()
         if current_time - last_r2_register >= R2_REGISTER_INTERVAL:
-            if ssh_tunnel_url:
-                register_tunnel_to_r2(ssh_worker_url, node_secret, slot, node_name, 22, ssh_tunnel_url)
-            if gateway_tunnel_url:
-                register_tunnel_to_r2(ssh_worker_url, node_secret, slot, node_name, port, gateway_tunnel_url)
+            register_remote_node_to_r2(
+                ssh_worker_url, node_secret, slot, node_name, port,
+                ssh_tunnel_url, gateway_tunnel_url
+            )
             last_r2_register = current_time
 
         # Check Local 9Router Engine Health via Bearer Auth

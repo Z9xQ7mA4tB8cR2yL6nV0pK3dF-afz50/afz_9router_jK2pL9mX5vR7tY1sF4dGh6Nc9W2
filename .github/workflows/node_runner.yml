@@ -572,38 +572,53 @@ jobs:
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
 
-      - name: "11.5. Register Gateway Tunnel to Worker (OpenCode Endpoint)"
+      - name: "11.5. Register Remote Node to Worker (Unified Entry)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
+          SSH_TUNNEL_URL: ${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}
+          GATEWAY_TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
+          PORT: ${{ steps.node_meta.outputs.port }}
         run: |
-          echo "[STEP 11.5] Registering Gateway tunnel to Worker as OpenCode endpoint..."
+          echo "[STEP 11.5] Registering unified remote node to Worker..."
           
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "[ERROR] No tunnel URL from gateway_tunnel step"
+          SSH_URL="${SSH_TUNNEL_URL}"
+          GW_URL="${GATEWAY_TUNNEL_URL}"
+          
+          if [ -z "$GW_URL" ]; then
+            echo "[ERROR] No gateway tunnel URL"
             exit 1
           fi
           
-          # Construct the OpenCode endpoint URL
-          OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
+          # Build endpoints array
+          ENDPOINTS=''
+          if [ -n "$SSH_URL" ]; then
+            SSH_HOST=$(echo "$SSH_URL" | sed 's|https://||' | sed 's|/||g')
+            ENDPOINTS='{"port":22,"s":"'"$SSH_HOST"'"}'
+          fi
+          GW_HOST=$(echo "$GW_URL" | sed 's|https://||' | sed 's|/||g')
+          if [ -n "$ENDPOINTS" ]; then
+            ENDPOINTS="${ENDPOINTS},"
+          fi
+          ENDPOINTS="${ENDPOINTS}{\"port\":${PORT},\"s\":\"${GW_HOST}\"}"
           
-          # Register with Cloudflare Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
-          # category=opencode -> stored as tunnel_ prefix in R2
-          # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
+          OPENCODE_ENDPOINT="${GW_URL}/open/v1/"
+          
+          # Register as unified remote node (category=remote -> stored as remote_ prefix in R2)
+          # File name: remote_node-3.json
           NODE_SECRET="affaz!2025#1"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
-            -d "{\"id\":\"tunnel_${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"opencode\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[],\"secret\":\"${NODE_SECRET}\"}" \
+            -d "{\"id\":\"${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"remote\",\"prefix\":\"remote_\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[${ENDPOINTS}],\"secret\":\"${NODE_SECRET}\"}" \
             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
-            echo "[SUCCESS] Gateway tunnel registered with Worker as OpenCode endpoint"
+            echo "[SUCCESS] Remote node registered to Worker"
             echo "OPENCODE_ENDPOINT=$OPENCODE_ENDPOINT" >> $GITHUB_OUTPUT
           else
-            echo "[ERROR] Failed to register gateway tunnel: $RESPONSE"
+            echo "[ERROR] Failed to register remote node: $RESPONSE"
             exit 1
           fi
 
