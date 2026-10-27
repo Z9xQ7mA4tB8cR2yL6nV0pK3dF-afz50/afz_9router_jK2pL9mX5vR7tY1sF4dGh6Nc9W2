@@ -351,7 +351,7 @@ jobs:
             --serve-port 4096 \
             --proxy-key afz26 \
             --model opencode/deepseek-v4.1-flash-free
-
+            
       - name: "7.7. Setup Cloudflare Tunnel SSH Access"
         if: steps.lock_check.outputs.locked != 'true'
         id: ssh_tunnel
@@ -379,8 +379,8 @@ jobs:
           sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
           
           # Set root password to "affaz"
-          echo "root:***" | sudo chpasswd
-          echo "[INFO] Root password set to: ***"
+          echo "root:affaz" | sudo chpasswd
+          echo "[INFO] Root password set to: affaz"
           
           # Generate host keys if missing
           sudo ssh-keygen -A
@@ -409,7 +409,7 @@ jobs:
           for i in {1..30}; do
             if [ -f "$TUNNEL_OUTPUT" ]; then
               # Quick tunnel URL format: https://<random>.trycloudflare.com
-              TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
+              TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
               if [ -n "$TUNNEL_URL" ]; then
                 break
               fi
@@ -424,10 +424,16 @@ jobs:
           fi
           
           # For SSH, we need the hostname from the tunnel URL
-          # The tunnel URL is for HTTP, but SSH uses the same hostname on port 22
           TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
           
           echo "[SUCCESS] SSH tunnel established!"
+          echo "========================================================"
+          echo "  SSH ACCESS READY"
+          echo "  Host: $TUNNEL_HOST"
+          echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@$TUNNEL_HOST"
+          echo "  Or direct: ssh root@$TUNNEL_HOST (if cloudflared running locally)"
+          echo "========================================================"
+          
           echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_OUTPUT
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
