@@ -370,17 +370,41 @@ jobs:
           cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
           TUNNEL_PID=$!
           
-          # Wait for tunnel to be ready and extract URL
+          # Wait for tunnel to be ready and extract URL with retry for 429 rate limit
           echo "[INFO] Waiting for tunnel to establish..."
-          for i in {1..30}; do
-            if [ -f "$TUNNEL_OUTPUT" ]; then
-              # Quick tunnel URL format: https://<random>.trycloudflare.com
-              TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
-              if [ -n "$TUNNEL_URL" ]; then
-                break
+          TUNNEL_URL=""
+          for attempt in {1..5}; do
+            echo "[INFO] Attempt $attempt/5 to get tunnel URL..."
+            for i in {1..30}; do
+              if [ -f "$TUNNEL_OUTPUT" ]; then
+                # Quick tunnel URL format: https://<random>.trycloudflare.com
+                TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
+                if [ -n "$TUNNEL_URL" ]; then
+                  break 2
+                fi
+                # Check for 429 rate limit error
+                if grep -q "429\|Tunnelstore request failed" "$TUNNEL_OUTPUT"; then
+                  echo "[WARN] Cloudflare rate limit (429) detected, waiting before retry..."
+                  break
+                fi
               fi
+              sleep 1
+            done
+            
+            if [ -n "$TUNNEL_URL" ]; then
+              break
             fi
-            sleep 1
+            
+            if [ $attempt -lt 5 ]; then
+              WAIT=$((attempt * 10))
+              echo "[INFO] Waiting ${WAIT}s before retry $((attempt + 1))..."
+              sleep $WAIT
+              # Restart cloudflared
+              kill $TUNNEL_PID 2>/dev/null || true
+              sleep 2
+              cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
+              TUNNEL_PID=$!
+            fi
           done
           
           if [ -z "$TUNNEL_URL" ]; then
@@ -494,16 +518,40 @@ jobs:
           cloudflared tunnel --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
           TUNNEL_PID=$!
           
-          # Wait for tunnel to be ready and extract URL
+          # Wait for tunnel to be ready and extract URL with retry for 429 rate limit
           echo "[INFO] Waiting for gateway tunnel to establish..."
-          for i in {1..30}; do
-            if [ -f "$TUNNEL_OUTPUT" ]; then
-              TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
-              if [ -n "$TUNNEL_URL" ]; then
-                break
+          TUNNEL_URL=""
+          for attempt in {1..5}; do
+            echo "[INFO] Attempt $attempt/5 to get tunnel URL..."
+            for i in {1..30}; do
+              if [ -f "$TUNNEL_OUTPUT" ]; then
+                TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
+                if [ -n "$TUNNEL_URL" ]; then
+                  break 2
+                fi
+                # Check for 429 rate limit error
+                if grep -q "429\|Tunnelstore request failed" "$TUNNEL_OUTPUT"; then
+                  echo "[WARN] Cloudflare rate limit (429) detected, waiting before retry..."
+                  break
+                fi
               fi
+              sleep 1
+            done
+            
+            if [ -n "$TUNNEL_URL" ]; then
+              break
             fi
-            sleep 1
+            
+            if [ $attempt -lt 5 ]; then
+              WAIT=$((attempt * 10))
+              echo "[INFO] Waiting ${WAIT}s before retry $((attempt + 1))..."
+              sleep $WAIT
+              # Restart cloudflared
+              kill $TUNNEL_PID 2>/dev/null || true
+              sleep 2
+              cloudflared tunnel --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
+              TUNNEL_PID=$!
+            fi
           done
           
           if [ -z "$TUNNEL_URL" ]; then
