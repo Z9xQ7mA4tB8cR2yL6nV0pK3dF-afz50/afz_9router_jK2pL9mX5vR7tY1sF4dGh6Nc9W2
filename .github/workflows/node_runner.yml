@@ -233,37 +233,47 @@ jobs:
             sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
             echo "[SUCCESS] WARP installed via direct .deb"
           else
-            echo "[WARN] Could not fetch .deb URL, trying apt with retries..."
+            echo "[WARN] Could not fetch .deb URL, trying known stable version..."
             
-            # Method 2: apt with retries and longer timeouts
-            sudo mkdir -p --mode=0755 /usr/share/keyrings
-            curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-            
-            # Retry apt update
-            for i in {1..3}; do
-              echo "[INFO] apt-get update attempt $i/3..."
-              if timeout 90 sudo apt-get update -qq; then
-                break
+            # Method 2: Try known stable WARP version
+            STABLE_DEB_URL="https://pkg.cloudflareclient.com/pool/main/c/cloudflare-warp/cloudflare-warp_2025.10.0-1_amd64.deb"
+            echo "[INFO] Trying stable version: $STABLE_DEB_URL"
+            if curl -fsSL --max-time 60 "$STABLE_DEB_URL" -o /tmp/cloudflare-warp.deb; then
+              sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y -qq
+              echo "[SUCCESS] WARP installed via stable .deb"
+            else
+              echo "[WARN] Stable .deb failed, trying apt with retries..."
+              
+              # Method 3: apt with retries and longer timeouts
+              sudo mkdir -p --mode=0755 /usr/share/keyrings
+              curl -fsSL --max-time 30 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+              echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+              
+              # Retry apt update
+              for i in {1..3}; do
+                echo "[INFO] apt-get update attempt $i/3..."
+                if timeout 90 sudo apt-get update -qq; then
+                  break
+                fi
+                sleep 10
+              done
+              
+              # Retry apt install
+              for i in {1..3}; do
+                echo "[INFO] apt-get install attempt $i/3..."
+                if timeout 180 sudo apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" cloudflare-warp; then
+                  break
+                fi
+                sleep 10
+              done
+              
+              if ! command -v warp-cli &> /dev/null; then
+                echo "[ERROR] WARP install failed after all methods"
+                exit 1
               fi
-              sleep 10
-            done
-            
-            # Retry apt install
-            for i in {1..3}; do
-              echo "[INFO] apt-get install attempt $i/3..."
-              if timeout 180 sudo apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" cloudflare-warp; then
-                break
-              fi
-              sleep 10
-            done
-            
-            if ! command -v warp-cli &> /dev/null; then
-              echo "[ERROR] WARP install failed after all retries"
-              exit 1
+              
+              echo "[SUCCESS] WARP installed via apt"
             fi
-            
-            echo "[SUCCESS] WARP installed via apt"
           fi
           
           echo "[INFO] Ensuring warp-svc daemon is active..."
