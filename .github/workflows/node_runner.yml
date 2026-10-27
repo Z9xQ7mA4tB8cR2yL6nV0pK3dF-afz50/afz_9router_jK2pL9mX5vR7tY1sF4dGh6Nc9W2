@@ -325,7 +325,7 @@ jobs:
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
-          WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
+          SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
         run: |
           echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel + registering to Worker..."
@@ -405,14 +405,14 @@ jobs:
           echo "  Password: affaz26"
           echo "========================================================"
           
-          # Register SSH tunnel to Worker (like check/ pattern)
+          # Register SSH tunnel to Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
           echo "[INFO] Registering SSH tunnel to Worker..."
           SSH_ENDPOINT="${TUNNEL_URL}/"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
             -H "authorization: Bearer $ADMIN_SECRET" \
             -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_ENDPOINT}\",\"endpoints\":[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"}],\"secret\":\"${ADMIN_SECRET}\"}" \
-            "${WORKER_URL}/api/register-model")
+            "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
             echo "[SUCCESS] SSH tunnel registered with Worker"
@@ -534,7 +534,7 @@ jobs:
         env:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
-          WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
+          SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
         run: |
@@ -548,12 +548,13 @@ jobs:
           # Construct the OpenCode endpoint URL
           OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
           
-          # Register with Cloudflare Worker (category=opencode -> stored as tunnel_ prefix in R2)
+          # Register with Cloudflare Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
+          # category=opencode -> stored as tunnel_ prefix in R2
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
             -H "authorization: Bearer $ADMIN_SECRET" \
             -d "{\"id\":\"tunnel_${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"opencode\",\"link\":\"${OPENCODE_ENDPOINT}\",\"endpoints\":[],\"secret\":\"${ADMIN_SECRET}\"}" \
-            "${WORKER_URL}/api/register-model")
+            "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
             echo "[SUCCESS] Gateway tunnel registered with Worker as OpenCode endpoint"
