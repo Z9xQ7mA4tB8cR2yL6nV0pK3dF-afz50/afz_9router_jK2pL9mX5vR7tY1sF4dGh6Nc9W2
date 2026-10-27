@@ -498,11 +498,17 @@ jobs:
         run: |
           echo "[STEP 11.5] Registering tunnel URL with Cloudflare Worker..."
           
-          # Extract tunnel URL from cloudflared log
-          TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+          # Extract tunnel URL from cloudflared log (try multiple patterns)
+          TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+          
+          # Fallback: try cloudflared API
+          if [ -z "$TUNNEL_URL" ]; then
+            TUNNEL_URL=$(curl -s --max-time 5 "http://127.0.0.1:4040/api/tunnels" | grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -1)
+          fi
           
           if [ -z "$TUNNEL_URL" ]; then
             echo "[ERROR] Could not extract tunnel URL from cloudflared log"
+            cat /tmp/cloudflared.log
             exit 1
           fi
           
