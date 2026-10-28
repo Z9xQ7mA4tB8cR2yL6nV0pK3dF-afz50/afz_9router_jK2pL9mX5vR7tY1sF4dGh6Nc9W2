@@ -181,6 +181,39 @@ jobs:
             sleep 10
           done
 
+      - name: "7. Claim Lock & Fetch Tunnel Token"
+        if: steps.lock_check.outputs.locked != 'true'
+        id: claim_tunnel
+        env:
+          WORKER_URL: ${{ steps.fetch_config.outputs.worker_url }}
+          WORKER_HANDSHAKE_TOKEN: ${{ steps.fetch_config.outputs.handshake_token }}
+          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          RUN_ID: ${{ steps.node_meta.outputs.run_id }}
+        run: |
+          echo "[STEP 7] Claiming lock and fetching tunnel token..."
+          
+          # Claim lock with --force (takeover if needed) - must pass run_id to claim lock
+          python3 scripts/monitor.py check-lock --slot "$SLOT" --force --run-id "$RUN_ID" --redis-base "${{ steps.fetch_config.outputs.redis_base }}"
+          
+          # Now lock exists, call tunnel-claim
+          RESPONSE=$(curl -s -X POST \
+            -H "x-handshake-token: $WORKER_HANDSHAKE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"run_id": "'$RUN_ID'"}' \
+            "$WORKER_URL/api/node/$SLOT/tunnel-claim")
+          
+          echo "Tunnel Claim Response: $RESPONSE"
+          
+          TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "[ERROR] Failed to get tunnel token"
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+          
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "[SUCCESS] Tunnel token acquired: ${TOKEN:0:20}..."
+
       - name: "8. Install 9Router CLI"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
@@ -321,6 +354,32 @@ jobs:
             echo "[ERROR] WARP proxy on port 40000 is not functional. Check warp-svc status."
             warp-cli --accept-tos status
             exit 1
+          fi
+
+      - name: "9. Install Cloudflare Tunnel Client (cloudflared)"
+        if: steps.lock_check.outputs.locked != 'true'
+        run: |
+          echo "[STEP 9] Installing Cloudflare Tunnel daemon (cloudflared)..."
+          sudo mkdir -p --mode=0755 /usr/share/keyrings
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+          echo "[SUCCESS] cloudflared $(cloudflared --version) installed and ready for authenticated handshake."
+
+      - name: "10. Start Cloudflare Tunnel (with claimed token)"
+        if: steps.lock_check.outputs.locked != 'true'
+        env:
+          TUNNEL_TOKEN: ${{ steps.claim_tunnel.outputs.token }}
+        run: |
+          echo "[STEP 10] Starting Cloudflare Tunnel..."
+          nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+          sleep 3
+          if curl -s --max-time 5 "http://127.0.0.1:4040/api/tunnels" | grep -q "healthy"; then
+            echo "[SUCCESS] Cloudflare Tunnel is running"
+          else
+            echo "[WARN] Tunnel may still be starting, check /tmp/cloudflared.log"
+            cat /tmp/cloudflared.log
           fi
 
       - name: "7.6. Install OpenCode CLI"
