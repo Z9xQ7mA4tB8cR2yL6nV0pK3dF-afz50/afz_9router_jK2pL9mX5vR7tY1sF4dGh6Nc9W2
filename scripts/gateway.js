@@ -54,50 +54,6 @@ const OPENCODE_PROXY_BASE = `http://127.0.0.1:${OPENCODE_PROXY_PORT}`;
 
 // In-memory ring buffer for low latency
 
-// Helper function to save tunnel URL to R2 via Cloudflare Worker
-async function registerTunnelUrlToR2(tunnelUrl, nodeAlias) {
-  try {
-    const workerUrl = process.env.CF_WORKER_URL || "https://affaz-node-manager.cmt202150.workers.dev";
-    const adminSecret = process.env.ADMIN_SECRET || "affaz";
-    
-    const payload = {
-      id: `tunnel_${SLOT}`,
-      alias: process.env.NODE_ALIAS || "OpenCode Node",
-      category: "opencode",
-      link: tunnelUrl,
-      endpoints: [],
-      last_seen: Date.now()
-    };
-    
-    const response = await fetch(`${process.env.CF_WORKER_URL || "https://affaz-node-manager.cmt202150.workers.dev"}/api/register-model`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${process.env.ADMIN_SECRET || "affaz"}`
-      },
-      body: JSON.stringify({
-        id: `tunnel_${SLOT}`,
-        alias: process.env.NODE_ALIAS || "OpenCode Node",
-        category: "opencode",
-        link: tunnelUrl,
-        endpoints: [],
-        secret: process.env.ADMIN_SECRET || "affaz"
-      })
-    });
-    
-    if (response.ok) {
-      console.log(`[TUNNEL] Saved tunnel URL to R2 for ${SLOT}`);
-      return true;
-    } else {
-      console.error("[TUNNEL] Failed to save to R2:", await response.text());
-      return false;
-    }
-  } catch (err) {
-    console.error("[TUNNEL] Error saving to R2:", err.message);
-    return false;
-  }
-}
-
 let buffer = [];
 let fileOffset = 0;
 const sseClients = new Set();
@@ -665,7 +621,5 @@ server.listen(PORT, "0.0.0.0", async () => {
     `[GATEWAY] Active on port ${PORT} for slot '${SLOT}'. Upstream 9Router: ${TARGET_PORT}. Log file: ${LOG_FILE}`
   );
   
-// Register tunnel URL to R2 via Cloudflare Worker
-  const tunnelUrl = process.env.TUNNEL_URL || `https://${SLOT}.${process.env.DOMAIN || "example.com"}/open/v1/`;
-  await registerTunnelUrlToR2(tunnelUrl, process.env.NODE_ALIAS || "OpenCode Node");
+
 });
