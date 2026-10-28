@@ -149,31 +149,41 @@ fi
 log "cron running: $(pgrep -x cron | head -1)"
 
 log "verify"
-if [ -n "${PROXY_API_KEY:-}" ]; then
-  AUTH=(-H "Authorization: Bearer $PROXY_API_KEY")
-else
-  AUTH=()
-fi
-
-curl -fsS -m 5 "http://127.0.0.1:$PRIMARY_PORT/health" >/dev/null \
-  || die "proxy :$PRIMARY_PORT health fail"
-curl -fsS -m 5 "http://127.0.0.1:$TEST_PORT/health" >/dev/null \
-  || die "proxy :$TEST_PORT health fail"
-curl -fsS -m 5 "http://127.0.0.1:$PRIMARY_PORT/open/v1/" >/dev/null \
-  || die "proxy /open/v1/ fail"
-
-MODEL_COUNT="$(curl -fsS -m 15 "${AUTH[@]}" \
-  "http://127.0.0.1:$PRIMARY_PORT/v1/models" | jq '.data | length')"
-log "models returned: $MODEL_COUNT"
-[ "$MODEL_COUNT" -gt 0 ] || warn "model list empty — opencode provider check koro"
-
-log "chat test"
-CHAT_OUT="$(curl -fsS -m 180 "${AUTH[@]}" \
-  -H 'content-type: application/json' \
-  "http://127.0.0.1:$PRIMARY_PORT/v1/chat/completions" \
-  -d "{\"model\":\"$DEFAULT_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly: SETUP_OK\"}]}" \
-  | jq -r '.choices[0].message.content // .error.message')"
-printf 'chat result: %s\n' "$CHAT_OUT"
+  if [ -n "${PROXY_API_KEY:-}" ]; then
+    AUTH=(-H "Authorization: Bearer $PROXY_API_KEY")
+  else
+    AUTH=()
+  fi
+  
+  curl -fsS -m 5 "http://127.0.0.1:$PRIMARY_PORT/health" >/dev/null \
+    || die "proxy :$PRIMARY_PORT health fail"
+  curl -fsS -m 5 "http://127.0.0.1:$TEST_PORT/health" >/dev/null \
+    || die "proxy :$TEST_PORT health fail"
+  curl -fsS -m 5 "http://127.0.0.1:$PRIMARY_PORT/open/v1/" >/dev/null \
+    || die "proxy /open/v1/ fail"
+  
+  # Wait for serve to be fully ready (opencode needs time to load models)
+  log "waiting for serve to be ready..."
+  for i in {1..30}; do
+    if curl -fsS -m 3 "http://127.0.0.1:$SERVE_PORT/health" >/dev/null 2>&1; then
+      log "serve :$SERVE_PORT ready"
+      break
+    fi
+    sleep 1
+  done
+  
+  MODEL_COUNT="$(curl -fsS -m 15 "${AUTH[@]}" \
+    "http://127.0.0.1:$PRIMARY_PORT/v1/models" | jq '.data | length')"
+  log "models returned: $MODEL_COUNT"
+  [ "$MODEL_COUNT" -gt 0 ] || warn "model list empty — opencode provider check koro"
+  
+  log "chat test"
+  CHAT_OUT="$(curl -fsS -m 180 "${AUTH[@]}" \
+    -H 'content-type: application/json' \
+    "http://127.0.0.1:$PRIMARY_PORT/v1/chat/completions" \
+    -d "{\"model\":\"$DEFAULT_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly: SETUP_OK\"}]}" \
+    | jq -r '.choices[0].message.content // .error.message')"
+  printf 'chat result: %s\n' "$CHAT_OUT"
 
 log "done"
 cat <<EOF
