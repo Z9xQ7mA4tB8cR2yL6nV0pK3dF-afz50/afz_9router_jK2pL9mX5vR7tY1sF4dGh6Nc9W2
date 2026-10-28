@@ -421,8 +421,13 @@ jobs:
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
           NODE_SECRET: ${{ secrets.NODE_SECRET }}
+          PORT: ${{ steps.node_meta.outputs.port }}
         run: |
           echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel + registering to Worker..."
+          
+          # Fix OpenCode config directory permissions
+          sudo mkdir -p /home/runner/.config/opencode
+          sudo chown -R runner:runner /home/runner/.config/opencode
           
           # Install cloudflared if not present
           if ! command -v cloudflared &> /dev/null; then
@@ -527,7 +532,8 @@ jobs:
           # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
           echo "[INFO] Registering SSH tunnel to Worker..."
           SSH_ENDPOINT="${TUNNEL_URL}/"
-          NODE_SECRET="affaz!2025#1"
+          # Mask secret in logs
+          echo "::add-mask::${NODE_SECRET}"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
             -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_ENDPOINT}\",\"endpoints\":[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"}],\"secret\":\"${NODE_SECRET}\"}" \
@@ -542,15 +548,15 @@ jobs:
           # Register unified remote node with SAME tunnel URL
           echo "[INFO] Registering unified remote node to Worker..."
           GW_HOST="${TUNNEL_HOST}"
-          SSH_HOST="${TUNNEL_HOST}"
           
           # Build endpoints array with both SSH and Gateway on SAME tunnel
-          ENDPOINTS="[{\"port\":22,\"s\":\"${SSH_HOST}\"},{\"port\":${PORT},\"s\":\"${GW_HOST}\"}]"
+          ENDPOINTS="[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"},{\"port\":${PORT},\"s\":\"${TUNNEL_HOST}\"}]"
           
           OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
           SSH_LINK="${TUNNEL_URL}/"
           
           # Register as unified remote node with same tunnel URL
+          echo "::add-mask::${NODE_SECRET}"
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
             -d "{\"id\":\"${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"remote\",\"prefix\":\"remote_\",\"link\":\"${SSH_LINK}\",\"endpoints\":${ENDPOINTS},\"secret\":\"${NODE_SECRET}\"}" \
