@@ -402,11 +402,11 @@ jobs:
             exit 1
           fi
           
-          # Start cloudflared quick tunnel for SSH (no Zero Trust required)
-          echo "[INFO] Starting Cloudflare quick tunnel for SSH..."
+          # Start cloudflared quick tunnel for BOTH SSH (port 22) and Gateway (port 6002/6003)
+          echo "[INFO] Starting Cloudflare quick tunnel for SSH + Gateway..."
           TUNNEL_OUTPUT=$(mktemp)
-          # cloudflared tunnel --url ssh://localhost:22 creates a quick trycloudflare.com tunnel
-          cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
+          # Single tunnel with multiple ingress rules
+          cloudflared tunnel --url ssh://localhost:22 --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
           TUNNEL_PID=$!
           
           # Wait for tunnel to be ready and extract URL with retry for 429 rate limit
@@ -441,7 +441,7 @@ jobs:
               # Restart cloudflared
               kill $TUNNEL_PID 2>/dev/null || true
               sleep 2
-              cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
+              cloudflared tunnel --url ssh://localhost:22 --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
               TUNNEL_PID=$!
             fi
           done
@@ -455,13 +455,13 @@ jobs:
           # For SSH, we need the hostname from the tunnel URL
           TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
           
-          echo "[SUCCESS] SSH tunnel established!"
+          echo "[SUCCESS] Combined tunnel established!"
           echo "========================================================"
-          echo "  SSH ACCESS READY"
+          echo "  COMBINED TUNNEL READY"
           echo "  Host: $TUNNEL_HOST"
-          echo "  Connect: ssh -o ProxyCommand=\"cloudflared access ssh --hostname %h\" root@$TUNNEL_HOST"
-          echo "  Or direct: ssh root@$TUNNEL_HOST (if cloudflared running locally)"
-          echo "  Password: [REDACTED]"
+          echo "  URL: $TUNNEL_URL"
+          echo "  SSH: ssh://localhost:22"
+          echo "  Gateway: http://localhost:$PORT"
           echo "========================================================"
           
           # Register SSH tunnel to Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
@@ -478,6 +478,31 @@ jobs:
             echo "[SUCCESS] SSH tunnel registered with Worker"
           else
             echo "[WARN] Failed to register SSH tunnel: $RESPONSE"
+          fi
+          
+          # Register unified remote node with SAME tunnel URL
+          echo "[INFO] Registering unified remote node to Worker..."
+          GW_HOST="${TUNNEL_HOST}"
+          SSH_HOST="${TUNNEL_HOST}"
+          
+          # Build endpoints array with both SSH and Gateway on SAME tunnel
+          ENDPOINTS="[{\"port\":22,\"s\":\"${SSH_HOST}\"},{\"port\":${PORT},\"s\":\"${GW_HOST}\"}]"
+          
+          OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
+          SSH_LINK="${TUNNEL_URL}/"
+          
+          # Register as unified remote node with same tunnel URL
+          RESPONSE=$(curl -s -X POST \
+            -H "content-type: application/json" \
+            -d "{\"id\":\"${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"remote\",\"prefix\":\"remote_\",\"link\":\"${SSH_LINK}\",\"endpoints\":${ENDPOINTS},\"secret\":\"${NODE_SECRET}\"}" \
+            "${SSH_WORKER_URL}/api/register-model")
+          
+          if echo "$RESPONSE" | grep -q "Node Registered"; then
+            echo "[SUCCESS] Remote node registered to Worker"
+            echo "OPENCODE_ENDPOINT=$OPENCODE_ENDPOINT" >> $GITHUB_OUTPUT
+          else
+            echo "[ERROR] Failed to register remote node: $RESPONSE"
+            exit 1
           fi
           
           echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_OUTPUT
@@ -543,76 +568,6 @@ jobs:
             echo "[INFO] Response received from models endpoint."
           fi
 
-      - name: "11. Start Cloudflare Quick Tunnel for Gateway (Port 6001)"
-        if: steps.lock_check.outputs.locked != 'true'
-        id: gateway_tunnel
-        env:
-          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
-          PORT: ${{ steps.node_meta.outputs.port }}
-        run: |
-          echo "[STEP 11] Starting Cloudflare quick tunnel for Gateway (port $PORT)..."
-          
-          # Start cloudflared quick tunnel for Gateway HTTP port
-          TUNNEL_OUTPUT=$(mktemp)
-          cloudflared tunnel --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
-          TUNNEL_PID=$!
-          
-          # Wait for tunnel to be ready and extract URL with retry for 429 rate limit
-          echo "[INFO] Waiting for gateway tunnel to establish..."
-          TUNNEL_URL=""
-          for attempt in {1..5}; do
-            echo "[INFO] Attempt $attempt/5 to get tunnel URL..."
-            for i in {1..30}; do
-              if [ -f "$TUNNEL_OUTPUT" ]; then
-                TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_OUTPUT" | head -1)
-                if [ -n "$TUNNEL_URL" ]; then
-                  break 2
-                fi
-                # Check for 429 rate limit error
-                if grep -q "429\|Tunnelstore request failed" "$TUNNEL_OUTPUT"; then
-                  echo "[WARN] Cloudflare rate limit (429) detected, waiting before retry..."
-                  break
-                fi
-              fi
-              sleep 1
-            done
-            
-            if [ -n "$TUNNEL_URL" ]; then
-              break
-            fi
-            
-            if [ $attempt -lt 5 ]; then
-              WAIT=$((attempt * 10))
-              echo "[INFO] Waiting ${WAIT}s before retry $((attempt + 1))..."
-              sleep $WAIT
-              # Restart cloudflared
-              kill $TUNNEL_PID 2>/dev/null || true
-              sleep 2
-              cloudflared tunnel --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
-              TUNNEL_PID=$!
-            fi
-          done
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "[ERROR] Failed to get gateway tunnel URL"
-            cat "$TUNNEL_OUTPUT"
-            exit 1
-          fi
-          
-          TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
-          
-          echo "[SUCCESS] Gateway tunnel established!"
-          echo "========================================================"
-          echo "  GATEWAY TUNNEL READY"
-          echo "  Host: $TUNNEL_HOST"
-          echo "  URL: $TUNNEL_URL"
-          echo "  Gateway Port: $PORT"
-          echo "========================================================"
-
-          echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_OUTPUT
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
-          echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
-
       - name: "11.5. Register SSH Tunnel to Worker (for nural SSH access)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
@@ -635,10 +590,7 @@ jobs:
           # Register SSH tunnel separately (category=ssh -> tunnel_ prefix)
           # This is what nural expects for SSH access
           NODE_SECRET="affaz!2025#1"
-          RESPONSE=$(curl -s -X POST \
-            -H "content-type: application/json" \
-            -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_URL}/\",\"endpoints\":[{\"port\":22,\"s\":\"${SSH_HOST}\"}],\"secret\":\"${NODE_SECRET}\"}" \
-            "${SSH_WORKER_URL}/api/register-model")
+          RESPONSE=$(curl -s -X POST             -H "content-type: application/json"             -d "{"id":"tunnel_${SLOT}-ssh","alias":"${NODE_NAME}-SSH","category":"ssh","link":"${SSH_URL}/","endpoints":[{"port":22,"s":"${SSH_HOST}"}],"secret":"${NODE_SECRET}"}"             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
             echo "[SUCCESS] SSH tunnel registered for nural access"
@@ -653,45 +605,29 @@ jobs:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.fetch_config.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          SSH_TUNNEL_URL: ${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}
-          GATEWAY_TUNNEL_URL: ${{ steps.gateway_tunnel.outputs.TUNNEL_URL }}
+          TUNNEL_URL: ${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
           echo "[STEP 11.6] Registering unified remote node to Worker..."
           
-          SSH_URL="${SSH_TUNNEL_URL}"
-          GW_URL="${GATEWAY_TUNNEL_URL}"
+          TUNNEL_URL="${TUNNEL_URL}"
           
-          if [ -z "$GW_URL" ]; then
-            echo "[ERROR] No gateway tunnel URL"
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "[ERROR] No tunnel URL"
             exit 1
           fi
           
-          # Build endpoints array
-          ENDPOINTS=''
-          if [ -n "$SSH_URL" ]; then
-            SSH_HOST=$(echo "$SSH_URL" | sed 's|https://||' | sed 's|/||g')
-            ENDPOINTS='{"port":22,"s":"'"$SSH_HOST"'"}'
-          fi
-          GW_HOST=$(echo "$GW_URL" | sed 's|https://||' | sed 's|/||g')
-          if [ -n "$ENDPOINTS" ]; then
-            ENDPOINTS="${ENDPOINTS},"
-          fi
-          ENDPOINTS="${ENDPOINTS}{\"port\":${PORT},\"s\":\"${GW_HOST}\"}"
+          TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||' | sed 's|/||g')
           
-          OPENCODE_ENDPOINT="${GW_URL}/open/v1/"
+          # Build endpoints array with both SSH and Gateway on SAME tunnel
+          ENDPOINTS="[{"port":22,"s":"${TUNNEL_HOST}"},{"port":${PORT},"s":"${TUNNEL_HOST}"}]"
           
-          # Register as unified remote node (category=remote -> stored as remote_ prefix in R2)
-          # link = SSH tunnel URL (for nural SSH access)
-          # endpoints[] = both SSH + Gateway (for info)
-          SSH_HOST=$(echo "$SSH_URL" | sed 's|https://||' | sed 's|/||g')
-          SSH_LINK="${SSH_URL}/"
+          OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
+          SSH_LINK="${TUNNEL_URL}/"
           
+          # Register as unified remote node with same tunnel URL
           NODE_SECRET="affaz!2025#1"
-          RESPONSE=$(curl -s -X POST \
-            -H "content-type: application/json" \
-            -d "{\"id\":\"${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"remote\",\"prefix\":\"remote_\",\"link\":\"${SSH_LINK}\",\"endpoints\":[${ENDPOINTS}],\"secret\":\"${NODE_SECRET}\"}" \
-            "${SSH_WORKER_URL}/api/register-model")
+          RESPONSE=$(curl -s -X POST             -H "content-type: application/json"             -d "{"id":"${SLOT}","alias":"${NODE_NAME}","category":"remote","prefix":"remote_","link":"${SSH_LINK}","endpoints":${ENDPOINTS},"secret":"${NODE_SECRET}"}"             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
             echo "[SUCCESS] Remote node registered to Worker"
