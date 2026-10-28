@@ -33,47 +33,16 @@ import subprocess
 import shutil
 import re
 import collections
-try:
-    from collections.abc import Mapping
-except ImportError:
-    from collections import Mapping
 import http.server
 import urllib.request
 import urllib.parse
 import urllib.error
-import json as json_module
 
 # Force unbuffered real-time stdout output in CI/CD consoles
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
 DEFAULT_REDIS_BASE = "https://jelab101-rimjhim.hf.space"
-
-def run_cmd(cmd_args, input_text=None, timeout=30):
-    """Module-level command runner for WARP operations."""
-    cmd_str = " ".join(cmd_args)
-    log("CMD_EXEC", f"Running: {cmd_str}")
-    try:
-        res = subprocess.run(
-            cmd_args,
-            input=input_text,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        out = res.stdout.strip()
-        err = res.stderr.strip()
-        if out:
-            for line in out.splitlines():
-                log("CMD_OUT", f"  {line}")
-        if err:
-            for line in err.splitlines():
-                log("CMD_ERR", f"  {line}")
-        log("CMD_STATUS", f"Command completed with exit code: {res.returncode}")
-        return res
-    except Exception as exc:
-        log("CMD_FAIL", f"Command execution exception: {exc}")
-        return None
 
 _LOG_BUFFER_LOCK = threading.Lock()
 _LOG_BUFFER = collections.deque(maxlen=100)
@@ -125,18 +94,13 @@ def calculate_port(slot: str) -> int:
         return port
     return 6001
 
-def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3, use_proxy: bool = True) -> str:
+def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3) -> str:
     """
-    Queries external IP reflection endpoint to verify egress IP.
-    If use_proxy=False, uses direct connection (for when WARP is disabled).
+    Queries external IP reflection endpoint through SOCKS5 proxy to verify WARP egress IP.
     """
     endpoints = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
     curl_bin = shutil.which("curl")
-    if not curl_bin:
-        return "127.0.0.1"
-
-    if use_proxy:
-        # Try through WARP SOCKS5 proxy first
+    if curl_bin:
         for ep in endpoints:
             try:
                 cmd = [curl_bin, "-s", "--max-time", str(timeout), "--socks5", proxy_addr, ep]
@@ -146,18 +110,15 @@ def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3,
                     return ip
             except Exception:
                 continue
-
-    # Fallback: direct connection (no proxy) - for when WARP is disabled or proxy unavailable
-    for ep in endpoints:
+        # Fallback direct curl if WARP socks5 not up yet
         try:
-            cmd = [curl_bin, "-s", "--max-time", str(timeout), ep]
+            cmd = [curl_bin, "-s", "--max-time", str(timeout), "https://api.ipify.org"]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
             ip = res.stdout.strip()
             if ip and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                 return ip
         except Exception:
-            continue
-
+            pass
     return "127.0.0.1"
 
 # ----------------- Thread-Safe Shared Node State -----------------
@@ -177,8 +138,6 @@ class NodeSharedState:
         self.is_healthy = False
         self.active_models_count = 0
         self.warp_ip = "127.0.0.1"
-        self.vm_ip = "127.0.0.1"
-        self.warp_enabled = False  # Default: WARP disabled (direct VM IP)
         self.models_list = []
         self.discovered_models = []
         self.providers = []
@@ -201,14 +160,6 @@ class NodeSharedState:
         with self.lock:
             self.warp_ip = ip
 
-    def update_vm_ip(self, ip: str):
-        with self.lock:
-            self.vm_ip = ip
-
-    def set_warp_enabled(self, enabled: bool):
-        with self.lock:
-            self.warp_enabled = enabled
-
     def get_snapshot(self):
         with self.lock:
             return {
@@ -223,8 +174,6 @@ class NodeSharedState:
                 "is_healthy": self.is_healthy,
                 "models_count": self.active_models_count,
                 "warp_ip": self.warp_ip,
-                "vm_ip": self.vm_ip,
-                "warp_enabled": self.warp_enabled,
                 "models_list": list(self.models_list),
                 "discovered_models": list(self.discovered_models),
                 "providers": list(self.providers),
@@ -376,194 +325,16 @@ class RateLimitDecisionEngine:
         self.consecutive_rl_count = 0
         self.cumulative_wait_sec = 0.0
 
-def toggle_warp(state: NodeSharedState, enable: bool, redis_base: str) -> str:
-    """
-    Toggle WARP on/off.
-    - enable=True: Connect WARP (register, set proxy mode, connect)
-    - enable=False: Disconnect WARP, stop warp-svc, clean registration
-    Returns the new egress IP.
-    
-    NOTE: In CI/GitHub Actions, WARP management is skipped (network breaks).
-    Only updates state for UI consistency.
-    """
-    # Skip actual WARP management in CI environments (GitHub Actions, etc.)
-    in_ci = os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true"
-    
-    warp_bin = shutil.which("warp-cli")
-    if not warp_bin or in_ci:
-        if in_ci:
-            log("WARP", f"CI environment detected - SIMULATING WARP {'enable' if enable else 'disable'}")
-        else:
-            log("WARP_WARN", "warp-cli not found on PATH. Cannot toggle WARP.")
-        
-        # Simulate: just update state, detect direct IP
-        if enable:
-            # WARP ON - use proxy
-            fresh_ip = detect_warp_egress_ip(use_proxy=True)
-        else:
-            # WARP OFF - force direct connection to get VM IP
-            fresh_ip = detect_warp_egress_ip(use_proxy=False)
-            # In CI, both might return Cloudflare IPs - use a marker for clarity
-            if fresh_ip.startswith("104.28.") or fresh_ip.startswith("172."):
-                fresh_ip = "127.0.0.1 (VM-direct)"
-        
-        state.update_warp_ip(fresh_ip)
-        state.set_warp_enabled(enable)
-        if not enable:
-            state.update_vm_ip(fresh_ip)
-        
-        snap = state.get_snapshot()
-        models_cnt = snap["models_count"]
-        state.update_health(
-            is_healthy=True,
-            models_count=models_cnt,
-            status="online",
-            status_msg=f"WARP {'enabled' if enable else 'disabled'} (simulated). Egress IP: {fresh_ip}"
-        )
-        log("WARP", f"WARP {'enabled' if enable else 'disabled'} for {state.slot} (simulated). Egress IP: {fresh_ip}")
-        return fresh_ip
-
-    snap = state.get_snapshot()
-    models_cnt = snap["models_count"]
-
-    if enable:
-        log("WARP", f"Enabling WARP for {state.slot}...")
-        state.update_health(
-            is_healthy=False,
-            models_count=models_cnt,
-            status="warp_connecting",
-            status_msg="Connecting Cloudflare WARP..."
-        )
-        # Connect WARP
-        run_cmd([warp_bin, "--accept-tos", "registration", "new"])
-        run_cmd([warp_bin, "--accept-tos", "mode", "proxy"])
-        run_cmd([warp_bin, "--accept-tos", "proxy", "port", "40000"])
-        run_cmd([warp_bin, "--accept-tos", "connect"])
-        time.sleep(3)
-    else:
-        log("WARP", f"Disabling WARP for {state.slot}...")
-        state.update_health(
-            is_healthy=False,
-            models_count=models_cnt,
-            status="warp_disconnecting",
-            status_msg="Disconnecting Cloudflare WARP..."
-        )
-        # Disconnect WARP (keep warp-svc running, just disconnect)
-        run_cmd([warp_bin, "--accept-tos", "disconnect"])
-        run_cmd([warp_bin, "--accept-tos", "registration", "delete"], input_text="y\n")
-        # DO NOT stop warp-svc or delete dirs - that breaks network routing
-        time.sleep(2)
-
-    # Detect new egress IP
-    if enable:
-        fresh_ip = detect_warp_egress_ip(use_proxy=True)
-    else:
-        fresh_ip = detect_warp_egress_ip(use_proxy=False)
-    state.update_warp_ip(fresh_ip)
-    
-    # Update warp_enabled flag and vm_ip
-    state.set_warp_enabled(enable)
-    if not enable:
-        # When WARP is disabled, detect direct VM IP
-        vm_ip = detect_warp_egress_ip(use_proxy=False)
-        state.update_vm_ip(vm_ip)
-    
-    state.update_health(
-        is_healthy=True,
-        models_count=models_cnt,
-        status="online",
-        status_msg=f"WARP {'enabled' if enable else 'disabled'}. Egress IP: {fresh_ip}"
-    )
-    log("WARP", f"WARP {'enabled' if enable else 'disabled'} for {state.slot}. New egress IP: {fresh_ip}")
-    
-    # Restart 9Router with new proxy settings based on WARP state
-    restart_9router_with_proxy(state, enable, redis_base)
-    
-    return fresh_ip
-
-
-def restart_9router_with_proxy(state: NodeSharedState, warp_enabled: bool, redis_base: str):
-    """Restart 9Router with appropriate proxy settings based on WARP state."""
-    slot = state.slot
-    log("WARP", f"Restarting 9Router for {slot} with WARP {'enabled' if warp_enabled else 'disabled'}")
-    
-    # Find and kill existing 9Router process (be specific to avoid killing monitor.py)
-    run_cmd(["pkill", "-f", "9router.*server\\.js"], timeout=5)
-    run_cmd(["pkill", "-f", "node.*9router"], timeout=5)
-    run_cmd(["pkill", "-f", "server\\.js"], timeout=5)
-    time.sleep(2)
-    
-    # Prepare environment for 9Router
-    env = os.environ.copy()
-    port = state.port
-    engine_port = port + 500
-    slot_name = state.slot
-    
-    if warp_enabled:
-        # WARP ON: Use WARP SOCKS5 proxy
-        env["ALL_PROXY"] = "socks5://127.0.0.1:40000"
-        env["HTTP_PROXY"] = "http://127.0.0.1:40000"
-        env["HTTPS_PROXY"] = "http://127.0.0.1:40000"
-        env["NO_PROXY"] = "localhost,127.0.0.1"
-        log("WARP", f"Starting 9Router with WARP proxy for {slot_name}")
-    else:
-        # WARP OFF: No proxy - direct connection
-        env.pop("ALL_PROXY", None)
-        env.pop("HTTP_PROXY", None)
-        env.pop("HTTPS_PROXY", None)
-        env.pop("NO_PROXY", None)
-        log("WARP", f"Starting 9Router WITHOUT proxy (direct) for {slot_name}")
-    
-    # Start 9Router
-    router_app_dir = f"{os.path.expanduser('~')}/.npm-global/lib/node_modules/9router/app"
-    if os.path.exists(f"{router_app_dir}/server.js"):
-        log("WARP", f"Starting standalone 9Router server on port {engine_port}")
-        subprocess.Popen(
-            ["node", f"{router_app_dir}/server.js"],
-            env={**env, "PORT": str(engine_port), "HOSTNAME": "0.0.0.0"},
-            stdout=open("/tmp/runner.log", "a"),
-            stderr=subprocess.STDOUT
-        )
-    else:
-        log("WARP", f"Starting 9Router CLI on port {engine_port}")
-        subprocess.Popen(
-            ["9router", "-p", str(engine_port), "-H", "0.0.0.0", "--tray", "-n"],
-            env=env,
-            stdout=open("/tmp/runner.log", "a"),
-            stderr=subprocess.STDOUT
-        )
-    
-    # Wait for 9Router to be ready
-    time.sleep(3)
-    
-    # Verify 9Router is responding
-    for i in range(10):
-        try:
-            import urllib.request
-            req = urllib.request.Request(f"http://127.0.0.1:{engine_port}/v1/models", headers={"User-Agent": "9Router-HealthCheck"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                if resp.status == 200:
-                    log("WARP", f"9Router restarted successfully on port {engine_port}")
-                    return
-        except Exception:
-            time.sleep(1)
-    
-    log("WARP_WARN", f"9Router restart verification failed on port {engine_port}")
-
-
-def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "", redis_base: str = None) -> bool:
+def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngine, rule: str = "") -> bool:
     """
     Executes Cloudflare WARP IP rotation:
     1. Updates shared state to 'rotating_ip' so heartbeat broadcasts to Redis.
     2. Runs warp-cli commands to disconnect and reconnect for a fresh Anycast edge IP.
     3. Verifies new outbound IP connectivity.
-    4. Checks if new IP is in Redis IP pool (if WARP enabled) - keeps rotating until fresh IP not in pool.
-    5. Restores state to 'online' and resets rate limit engine counters.
+    4. Restores state to 'online' and resets rate limit engine counters.
     """
     snap = state.get_snapshot()
     models_cnt = snap["models_count"]
-    warp_enabled = snap.get("warp_enabled", False)  # Default FALSE - never auto-re-enable
-    slot = snap["slot"]
     rule_tag = f"[{rule}] " if rule else ""
 
     state.update_health(
@@ -586,6 +357,31 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
             status_msg="WARP simulated rotation complete (mock)"
         )
         return True
+
+    def run_cmd(cmd_args, input_text=None, timeout=30):
+        cmd_str = " ".join(cmd_args)
+        log("CMD_EXEC", f"Running: {cmd_str}")
+        try:
+            res = subprocess.run(
+                cmd_args,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            out = res.stdout.strip()
+            err = res.stderr.strip()
+            if out:
+                for line in out.splitlines():
+                    log("CMD_OUT", f"  {line}")
+            if err:
+                for line in err.splitlines():
+                    log("CMD_ERR", f"  {line}")
+            log("CMD_STATUS", f"Command completed with exit code: {res.returncode}")
+            return res
+        except Exception as exc:
+            log("CMD_FAIL", f"Command execution exception: {exc}")
+            return None
 
     def probe_trace(stage_label: str) -> str:
         log("TEST_TRACE", f"[{stage_label}] Querying Cloudflare Edge Trace (/cdn-cgi/trace)...")
@@ -619,67 +415,21 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
         log("TEST_RESULT", f"[{stage_label}] Fallback IP reflection -> {fallback_ip}")
         return fallback_ip
 
-    def fetch_ip_pool():
-        """Fetch IP pool from Redis via worker API."""
-        if not redis_base:
-            return []
-        try:
-            url = f"{redis_base.rstrip('/')}/api/node/{slot}/ip-pool"
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "9Router-Monitor/2.0", "Accept": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if data.get("success") and isinstance(data.get("pool"), list):
-                    return [entry.get("ip") for entry in data["pool"] if entry.get("ip")]
-        except Exception as e:
-            log("IP_POOL_WARN", f"Failed to fetch IP pool: {e}")
-        return []
-
-    def is_ip_in_pool(ip, pool_ips):
-        """Check if IP is in the pool (exact match)."""
-        return ip in pool_ips
-
     try:
         # ======================================================================
-        # STAGE 0: Check WARP status and fetch IP pool
-        # ======================================================================
-        if not warp_enabled:
-            log("WARP", "WARP is DISABLED. Skipping rotation, using direct VM IP.")
-            # Just detect current direct IP
-            vm_ip = detect_warp_egress_ip()
-            state.update_warp_ip(vm_ip)
-            state.update_vm_ip(vm_ip)
-            state.update_health(
-                is_healthy=True,
-                models_count=models_cnt,
-                status="online",
-                status_msg=f"WARP disabled. Direct VM IP: {vm_ip}"
-            )
-            return True
-
-        # WARP is enabled - fetch IP pool
-        ip_pool = fetch_ip_pool()
-        log("WARP", f"Current IP pool ({len(ip_pool)} entries): {ip_pool}")
-
-        # ======================================================================
-        # STAGE 1: BASELINE TRACE (Current Egress IP before rotation)
+        # STAGE 0: BASELINE TRACE (Current Egress IP before rotation)
         # ======================================================================
         log("WARP", "Step 1: Inspecting baseline egress IP before rotation...")
         baseline_ip = probe_trace("BASELINE")
         log("WARP", f"Baseline Egress IP: {baseline_ip}")
 
         final_ip = baseline_ip
-        max_attempts = 8  # Increased to allow pool avoidance
+        max_attempts = 4
         start_time = time.time()
 
         for attempt in range(1, max_attempts + 1):
             elapsed = int(time.time() - start_time)
             log("WARP", f"--- IP Rotation Attempt #{attempt}/{max_attempts} (Elapsed: {elapsed}s) ---")
-
-            # Refresh pool before each attempt
-            ip_pool = fetch_ip_pool()
 
             if attempt == 1:
                 # Fast Re-registration Cycle (3-5s)
@@ -708,9 +458,9 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
                 run_cmd([warp_bin, "--accept-tos", "connect"])
                 time.sleep(3)
             else:
-                # Deep Cache/State Wipe & Extended Cooldown (10-30s)
-                cooldown_sec = min(10 + (attempt - 3) * 5, 30)  # 10s, 15s, 20s, 25s, 30s
-                log("WARP_WARN", f"Attempt #{attempt}: Deep state purge & {cooldown_sec}s edge session backoff (avoiding pooled IPs)...")
+                # Deep Cache/State Wipe & Extended Cooldown (~8s)
+                cooldown_sec = 8
+                log("WARP_WARN", f"Attempt #{attempt}: Deep state purge & {cooldown_sec}s edge session backoff...")
                 run_cmd([warp_bin, "--accept-tos", "disconnect"])
                 run_cmd(["sudo", "systemctl", "stop", "warp-svc"])
                 run_cmd(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp", "/etc/cloudflare-warp"])
@@ -725,24 +475,16 @@ def execute_warp_rotation(state: NodeSharedState, engine: RateLimitDecisionEngin
 
             run_cmd([warp_bin, "--accept-tos", "status"])
             cand_ip = probe_trace(f"ATTEMPT_{attempt}")
-            
-            # Check if new IP is different from baseline AND not in pool
             if cand_ip and cand_ip != "unknown" and cand_ip != baseline_ip:
-                if is_ip_in_pool(cand_ip, ip_pool):
-                    log("WARP_WARN", f"🎯 New IP {cand_ip} is IN POOL (blocked). Continuing rotation...")
-                    # Continue to next attempt
-                    continue
-                else:
-                    final_ip = cand_ip
-                    log("WARP", f"🎉 IP Rotation SUCCESS! IP changed from {baseline_ip} to {final_ip} (Attempt #{attempt}, Total: {int(time.time() - start_time)}s). IP is FRESH (not in pool).")
-                    break
+                final_ip = cand_ip
+                log("WARP", f"🎉 IP Rotation SUCCESS! IP changed from {baseline_ip} to {final_ip} (Attempt #{attempt}, Total: {int(time.time() - start_time)}s).")
+                break
             else:
                 log("WARP_WARN", f"Attempt #{attempt} completed: IP remains {cand_ip}. Will escalate/retry...")
 
         if final_ip == baseline_ip:
-            # Last resort - just get whatever IP we can
             final_ip = detect_warp_egress_ip()
-            log("WARP_WARN", f"Rotation attempts exhausted. Final active egress IP: {final_ip} (may be in pool)")
+            log("WARP_WARN", f"Rotation attempts exhausted. Final active egress IP: {final_ip}")
 
         state.update_warp_ip(final_ip)
         engine.on_warp_rotated()
@@ -853,18 +595,12 @@ def cmd_check_lock(args):
     lock_key = f"9rt:lock:{slot}"
 
     if getattr(args, "force", False):
-        log("PREFLIGHT", f"Force flag active! Claiming lock for slot '{slot}'...")
-        # Generate run_id if not provided
-        run_id = getattr(args, "run_id", None) or f"{slot}_{int(time.time())}"
-        # Claim the lock in Redis (TTL 60s)
-        redis_setex_str(redis_base, lock_key, 60, run_id)
-        log("PREFLIGHT", f"Lock claimed for '{slot}' with run_id '{run_id}'")
+        log("PREFLIGHT", f"Force flag active! Bypassing lock check for slot '{slot}'...")
         gh_output = os.environ.get("GITHUB_OUTPUT")
         if gh_output and os.path.exists(gh_output):
             with open(gh_output, "a") as f:
                 f.write("is_locked=false\n")
                 f.write(f"canonical_slot={slot}\n")
-                f.write(f"run_id={run_id}\n")
         sys.exit(0)
 
     log("PREFLIGHT", f"Checking lock for slot '{slot}' ({lock_key})...")
@@ -932,21 +668,12 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                     if action == "rotate_ip":
                         log("CMD_CONSUMER", "Executing WARP IP rotation by command...")
                         if rl_engine:
-                            execute_warp_rotation(state, rl_engine, rule="USER_COMMAND", redis_base=redis_base)
+                            execute_warp_rotation(state, rl_engine, rule="USER_COMMAND")
                         fresh_ip = detect_warp_egress_ip()
                         state.update_warp_ip(fresh_ip)
                         ack_payload["new_ip"] = fresh_ip
                         ack_payload["message"] = f"WARP IP rotated to {fresh_ip}."
                         log("CMD_CONSUMER", f"WARP IP rotated to: {fresh_ip}")
-
-                    elif action == "warp_toggle":
-                        enable = cmd.get("enable", True)
-                        log("CMD_CONSUMER", f"Executing WARP toggle: enable={enable}")
-                        fresh_ip = toggle_warp(state, enable, redis_base)
-                        ack_payload["new_ip"] = fresh_ip
-                        ack_payload["warp_enabled"] = enable
-                        ack_payload["message"] = f"WARP {'enabled' if enable else 'disabled'}. Egress IP: {fresh_ip}"
-                        log("CMD_CONSUMER", f"WARP {'enabled' if enable else 'disabled'} for {state.slot}. New egress IP: {fresh_ip}")
 
                     else:
                         ack_payload["status"] = "ignored"
@@ -1052,8 +779,6 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "status": snap["status"],
             "status_msg": snap["status_msg"],
             "warp_ip": snap["warp_ip"],
-            "vm_ip": snap.get("vm_ip", "127.0.0.1"),
-            "warp_enabled": snap.get("warp_enabled", True),
             "provider": primary_provider,
             "providers": active_providers,
             "models": compact_models,
@@ -1111,7 +836,7 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
             if token:
                 cloudflared_bin = shutil.which("cloudflared")
                 if cloudflared_bin:
-                    log("TUNNEL", f"Security Handshake SUCCESS! Launching Cloudflare Tunnel for {slot} (Port {port})....")
+                    log("TUNNEL", f"Security Handshake SUCCESS! Launching Cloudflare Tunnel for {slot} (Port {port})...")
                     cmd = [cloudflared_bin, "tunnel", "--no-autoupdate", "run", "--token", token]
                     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     log("TUNNEL", f"Cloudflare Tunnel active and connected in background!")
@@ -1124,118 +849,6 @@ def claim_and_start_tunnel(worker_url: str, handshake_token: str, slot: str, run
         log("TUNNEL_ERR", f"Tunnel handshake failed ({e.code}): {err_msg}")
     except Exception as e:
         log("TUNNEL_ERR", f"Tunnel handshake error: {e}")
-
-
-def register_tunnel_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node_name: str, port: int, tunnel_url: str):
-    """
-    Register tunnel to ssh-cf-worker R2 via /api/register-model.
-    Called periodically to keep R2 last_seen fresh (prevents scheduled cleanup).
-    Uses urllib (stdlib) - no external dependencies.
-    """
-    if not ssh_worker_url or not tunnel_url:
-        return False
-    
-    # Determine category and prefix based on port
-    # Port 22 = SSH, Port 6001/6002 = OpenCode Gateway
-    if port == 22:
-        category = "ssh"
-        tunnel_id = f"tunnel_{slot}-ssh"
-        alias = f"{node_name}-SSH"
-        endpoints = [{"port": 22, "s": tunnel_url.replace("https://", "").replace("/", "")}]
-    else:
-        category = "opencode"
-        tunnel_id = f"tunnel_{slot}"
-        alias = node_name  # Poetic name from NODE_CONFIG
-        endpoints = []
-    
-    # Construct endpoint URL
-    if category == "opencode":
-        endpoint_url = f"{tunnel_url}/open/v1/"
-    else:
-        endpoint_url = f"{tunnel_url}/"
-    
-    payload = {
-        "id": tunnel_id,
-        "alias": alias,
-        "category": category,
-        "link": endpoint_url,
-        "endpoints": endpoints,
-        "secret": node_secret
-    }
-    
-    try:
-        register_url = f"{ssh_worker_url.rstrip('/')}/api/register-model"
-        data = json_module.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(register_url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                log("R2_REG", f"Tunnel {tunnel_id} registered to R2 ({category})")
-                return True
-            else:
-                log("R2_REG_WARN", f"Registration failed ({resp.status}): {resp.read().decode()}")
-                return False
-    except Exception as e:
-        log("R2_REG_ERR", f"Registration error: {e}")
-        return False
-
-
-def register_remote_node_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node_name: str, port: int, ssh_tunnel_url: str, gateway_tunnel_url: str):
-    """
-    Register unified remote node to ssh-cf-worker R2 with prefix 'remote_'.
-    Single entry combining SSH + Gateway endpoints.
-    File name: remote_node-3.json
-    Uses urllib (stdlib) - no external dependencies.
-    """
-    if not ssh_worker_url or not gateway_tunnel_url:
-        return False
-    
-    # Unified remote node entry
-    tunnel_id = slot  # e.g., "node-3"
-    alias = node_name  # Poetic name from NODE_CONFIG
-    category = "remote"
-    prefix = "remote_"
-    
-    # Build endpoints array with both SSH and Gateway
-    endpoints = []
-    
-    # SSH endpoint (port 22)
-    if ssh_tunnel_url:
-        ssh_host = ssh_tunnel_url.replace("https://", "").replace("/", "")
-        endpoints.append({"port": 22, "s": ssh_host})
-    
-    # Gateway endpoint (port 6001/6002/6003)
-    if gateway_tunnel_url:
-        gateway_host = gateway_tunnel_url.replace("https://", "").replace("/", "")
-        endpoints.append({"port": port, "s": gateway_host})
-    
-    # Main link is the gateway tunnel for OpenCode access
-    endpoint_url = f"{gateway_tunnel_url}/open/v1/"
-    
-    payload = {
-        "id": tunnel_id,
-        "alias": alias,
-        "category": category,
-        "prefix": prefix,
-        "link": endpoint_url,
-        "endpoints": endpoints,
-        "secret": node_secret
-    }
-    
-    try:
-        register_url = f"{ssh_worker_url.rstrip('/')}/api/register-model"
-        data = json_module.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(register_url, data=json_module.dumps(payload).encode('utf-8'), headers={'Content-Type': 'application/json'}, method='POST')
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                log("R2_REG", f"Remote node {tunnel_id} registered to R2 (prefix: {prefix}) with {len(endpoints)} endpoints")
-                return True
-            else:
-                log("R2_REG_WARN", f"Registration failed ({resp.status}): {resp.read().decode()}")
-                return False
-    except Exception as e:
-        log("R2_REG_ERR", f"Registration error: {e}")
-        return False
-
 
 def stream_sync_worker(state: NodeSharedState, redis_base: str):
     """
@@ -1276,24 +889,63 @@ def run_local_log_server(slot: str, port: int):
     except Exception:
         pass
 
-def get_local_api_key(db_path=None):
-    """Read API key from 9Router SQLite database."""
-    if db_path is None:
-        db_path = os.path.expanduser("~/.9router/db/data.sqlite")
+def register_remote_node_to_r2(ssh_worker_url: str, node_secret: str, slot: str, node_name: str, port: int, ssh_tunnel_url: str, gateway_tunnel_url: str):
+    """
+    Register unified remote node to ssh-cf-worker R2 with prefix 'remote_'.
+    Single entry combining SSH + Gateway endpoints.
+    File name: remote_node_X.json (underscore format)
+    Uses urllib (stdlib) - no external dependencies.
+    """
+    if not ssh_worker_url or not gateway_tunnel_url:
+        log("R2_REG_WARN", "Missing required URLs for R2 registration")
+        return False
+    
     try:
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT key FROM apiKeys WHERE isActive = 1 LIMIT 1")
-        row = cur.fetchone()
-        conn.close()
-        if row and row[0]:
-            return row[0]
+        # Unified remote node entry
+        tunnel_id = slot  # e.g., "node-3"
+        alias = node_name  # Poetic name from NODE_CONFIG
+        category = "remote"
+        prefix = "remote_"
+        
+        # Build endpoints array with both SSH and Gateway
+        endpoints = []
+        
+        # SSH endpoint (port 22)
+        if ssh_tunnel_url:
+            ssh_host = ssh_tunnel_url.replace("https://", "").replace("/", "")
+            endpoints.append({"port": 22, "s": ssh_host})
+        
+        # Gateway endpoint (port 6001/6002/6003)
+        if gateway_tunnel_url:
+            gateway_host = gateway_tunnel_url.replace("https://", "").replace("/", "")
+            endpoints.append({"port": port, "s": gateway_host})
+        
+        # Main link is the SSH tunnel base URL (for nural SSH access)
+        endpoint_url = f"{ssh_tunnel_url.rstrip('/')}/" if ssh_tunnel_url else ""
+        
+        payload = {
+            "id": tunnel_id,
+            "alias": alias,
+            "category": category,
+            "prefix": prefix,
+            "link": endpoint_url,
+            "endpoints": endpoints,
+            "secret": node_secret
+        }
+        
+        register_url = f"{ssh_worker_url.rstrip('/')}/api/register-model"
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(register_url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                log("R2_REG", f"Remote node {tunnel_id} registered to R2 (prefix: {prefix}) with {len(endpoints)} endpoints")
+                return True
+            else:
+                log("R2_REG_WARN", f"Registration failed ({resp.status}): {resp.read().decode()}")
+                return False
     except Exception as e:
-        log("WARN", f"Could not read API key from DB: {e}")
-    return None
-
-
+        log("R2_REG_ERR", f"Registration exception: {e}")
+        return False
 def cmd_run_daemon(args):
     slot = normalize_slot(args.slot)
     port = args.port or calculate_port(slot)
@@ -1321,24 +973,12 @@ def cmd_run_daemon(args):
     log("INIT", f"Redis API Base : {redis_base}")
     print("=" * 70, flush=True)
 
-    # Read API key from local 9Router DB (auto-generated during seed)
-    local_api_key = get_local_api_key()
-    if local_api_key:
-        log("INIT", f"Loaded API key from local DB: {local_api_key[:12]}...")
-    else:
-        log("WARN", "No API key found in local DB, model discovery may fail")
-
     # Initialize Thread-Safe Shared State
     state = NodeSharedState(slot, node_name, port, run_id, gh_run_id, boot_timestamp)
 
     # Initial Lock Claim and Registration
     log("INIT", f"Claiming initial lock lease at {lock_key}...")
     redis_setex_str(redis_base, lock_key, 60, run_id)
-
-    # Clear any stale pending commands from previous runs
-    cmd_key = f"9rt:cmd:{slot}"
-    redis_del(redis_base, cmd_key)
-    log("INIT", f"Cleared stale command queue at {cmd_key}")
 
     initial_hb = {
         "slot": slot,
@@ -1356,11 +996,13 @@ def cmd_run_daemon(args):
     log("INIT", f"Initial heartbeat registered in Redis.")
 
     # Dynamic Security Handshake: Claim Cloudflare Tunnel from Worker after Heartbeat is active in Redis
-    # SKIPPED: Quick tunnels are now created in GitHub Actions workflow (Step 11)
-    # worker_url = getattr(args, "worker_url", None) or os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev")
-    # handshake_token = getattr(args, "handshake_token", None) or os.environ.get("WORKER_HANDSHAKE_TOKEN", "")
-    # claim_and_start_tunnel(worker_url, handshake_token, slot, run_id, port, gh_run_id)
-    log("INIT", "Skipping tunnel claim - using quick tunnels from workflow Step 11")
+    worker_url = getattr(args, "worker_url", None) or os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev")
+    handshake_token = getattr(args, "handshake_token", None) or os.environ.get("WORKER_HANDSHAKE_TOKEN", "")
+    ssh_worker_url = getattr(args, "ssh_worker_url", None) or os.environ.get("SSH_WORKER_URL", "https://affaz-ssh.cmt202150.workers.dev")
+    node_secret = getattr(args, "node_secret", None) or os.environ.get("NODE_SECRET", "affaz!2025#1")
+    ssh_tunnel_url = getattr(args, "ssh_tunnel_url", None) or os.environ.get("SSH_TUNNEL_URL", "")
+    gateway_tunnel_url = getattr(args, "gateway_tunnel_url", None) or os.environ.get("GATEWAY_TUNNEL_URL", "")
+    claim_and_start_tunnel(worker_url, handshake_token, slot, run_id, port, gh_run_id)
 
     # Initialize Rate Limit & WARP Decision Matrix Engine
     rl_engine = RateLimitDecisionEngine(boot_timestamp)
@@ -1412,44 +1054,35 @@ def cmd_run_daemon(args):
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    # 9Router is already started in Step 9 of workflow.
-    # Only restart when WARP toggle explicitly changes (via command).
-    log("INIT", "9Router already running from workflow Step 9. Skipping restart.")
-
     # Main Thread: Engine Supervisor & Health Monitor Loop
     models_url = f"http://127.0.0.1:{port}/v1/models"
 
     # R2 Re-registration tracking
-    ssh_tunnel_url = getattr(args, "ssh_tunnel_url", None) or os.environ.get("SSH_TUNNEL_URL", "")
-    gateway_tunnel_url = getattr(args, "gateway_tunnel_url", None) or os.environ.get("GATEWAY_TUNNEL_URL", "")
-    ssh_worker_url = getattr(args, "ssh_worker_url", None) or os.environ.get("SSH_WORKER_URL", "https://affaz-ssh.cmt202150.workers.dev")
-    node_secret = getattr(args, "node_secret", None) or os.environ.get("NODE_SECRET", "affaz!2025#1")
     last_r2_register = 0
     R2_REGISTER_INTERVAL = 30  # seconds
 
     while True:
-        try:
-            snap = state.get_snapshot()
-            if not snap["is_running"]:
-                break
+        snap = state.get_snapshot()
+        if not snap["is_running"]:
+            break
 
-            # Periodic R2 re-registration to keep last_seen fresh (every 30s)
-            current_time = time.time()
-            if current_time - last_r2_register >= R2_REGISTER_INTERVAL:
-                try:
-                    success = register_remote_node_to_r2(
-                        ssh_worker_url, node_secret, slot, node_name, port,
-                        ssh_tunnel_url, gateway_tunnel_url
-                    )
-                    if success:
-                        last_r2_register = current_time
-                        log("R2_REG", f"Periodic re-registration successful for {slot}")
-                    else:
-                        log("R2_REG_WARN", f"Periodic re-registration failed for {slot}, will retry next cycle")
-                except Exception as e:
-                    log("R2_REG_ERR", f"Re-registration exception: {e}, will retry next cycle")
+        # Periodic R2 re-registration to keep last_seen fresh (every 30s)
+        current_time = time.time()
+        if current_time - last_r2_register >= R2_REGISTER_INTERVAL:
+            try:
+                success = register_remote_node_to_r2(
+                    ssh_worker_url, node_secret, slot, node_name, port,
+                    ssh_tunnel_url, gateway_tunnel_url
+                )
+                if success:
+                    last_r2_register = current_time
+                    log("R2_REG", f"Periodic re-registration successful for {slot}")
+                else:
+                    log("R2_REG_WARN", f"Periodic re-registration failed for {slot}, will retry next cycle")
+            except Exception as e:
+                log("R2_REG_ERR", f"Re-registration exception: {e}, will retry next cycle")
 
-            # Check Local 9Router Engine Health via Bearer Auth
+        # Check Local 9Router Engine Health via Bearer Auth
         is_healthy = False
         models_count = 0
         status = "online"
@@ -1458,13 +1091,10 @@ def cmd_run_daemon(args):
         discovered_items = snap.get("discovered_models", [])
         discovered_providers = snap.get("providers", [])
 
-        # Use local API key from DB for engine auth
-        engine_api_key = local_api_key or api_key
-
         try:
             req = urllib.request.Request(
                 models_url,
-                headers={"Authorization": f"Bearer {engine_api_key}"}
+                headers={"Authorization": f"Bearer {api_key}"}
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 if resp.status == 200:
@@ -1560,7 +1190,7 @@ def cmd_run_daemon(args):
                 log("RL_DECISION", f"Decision: [{decision.rule}] -> {decision.action} ({decision.reason})")
 
                 if decision.action == DecisionResult.ACTION_SHIFT_TO_W:
-                    execute_warp_rotation(state, rl_engine, rule=decision.rule, redis_base=redis_base)
+                    execute_warp_rotation(state, rl_engine, rule=decision.rule)
                     continue
                 else:
                     status = "cooldown"
@@ -1662,7 +1292,6 @@ def main():
     p_check = subparsers.add_parser("check-lock", help="Pre-flight check if slot is actively locked")
     p_check.add_argument("--slot", required=True, help="Target slot name (e.g. node-1 or node-3)")
     p_check.add_argument("--force", action="store_true", help="Force run: bypass lock check and take over slot")
-    p_check.add_argument("--run-id", help="Explicit session RUN_ID (required with --force to claim lock)")
     p_check.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
 
     # Subcommand: run
@@ -1675,10 +1304,11 @@ def main():
     p_run.add_argument("--api-key", help="9Router master API key")
     p_run.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
     p_run.add_argument("--worker-url", default=os.environ.get("WORKER_URL", "https://9router.cmt202150.workers.dev"), help="Cloudflare Worker base URL")
+    p_run.add_argument("--handshake-token", default=os.environ.get("WORKER_HANDSHAKE_TOKEN", ""), help="Handshake token for claiming Cloudflare tunnel")
     p_run.add_argument("--ssh-worker-url", default=os.environ.get("SSH_WORKER_URL", "https://affaz-ssh.cmt202150.workers.dev"), help="SSH Cloudflare Worker URL for R2 registration")
     p_run.add_argument("--node-secret", default=os.environ.get("NODE_SECRET", "affaz!2025#1"), help="Secret for R2 registration (matches ssh-cf-worker NODE_SECRET)")
-    p_run.add_argument("--ssh-tunnel-url", default=os.environ.get("SSH_TUNNEL_URL", ""), help="SSH tunnel URL (e.g. https://xxx.trycloudflare.com)")
-    p_run.add_argument("--gateway-tunnel-url", default=os.environ.get("GATEWAY_TUNNEL_URL", ""), help="Gateway tunnel URL (e.g. https://xxx.trycloudflare.com)")
+    p_run.add_argument("--ssh-tunnel-url", help="SSH tunnel URL (e.g. https://xxx.trycloudflare.com)")
+    p_run.add_argument("--gateway-tunnel-url", help="Gateway tunnel URL (e.g. https://xxx.trycloudflare.com)")
 
     # Subcommand: test-rl-matrix
     subparsers.add_parser("test-rl-matrix", help="Run automated test suite for RateLimitDecisionEngine")
