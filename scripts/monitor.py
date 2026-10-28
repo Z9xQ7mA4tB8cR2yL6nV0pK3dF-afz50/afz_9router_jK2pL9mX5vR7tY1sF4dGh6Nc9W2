@@ -32,6 +32,7 @@ import threading
 import subprocess
 import shutil
 import re
+import collections
 try:
     from collections.abc import Mapping
 except ImportError:

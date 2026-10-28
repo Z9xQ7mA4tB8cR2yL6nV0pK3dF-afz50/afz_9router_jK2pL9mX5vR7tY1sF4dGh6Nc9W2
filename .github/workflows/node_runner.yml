@@ -671,7 +671,6 @@ jobs:
           NO_PROXY: "localhost,127.0.0.1"
         run: |
           echo "[STEP 12] Running Telemetry & Lease Daemon for $NODE ($NODE_NAME)..."
-          pip install requests -q
           python3 -u scripts/monitor.py run \
             --slot "$NODE" \
             --name "$NODE_NAME" \
