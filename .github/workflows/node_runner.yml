@@ -420,7 +420,6 @@ jobs:
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
           NODE_NAME: ${{ steps.node_meta.outputs.node_name }}
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          NODE_SECRET: ${{ secrets.NODE_SECRET }}
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
           echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel + registering to Worker..."
@@ -429,6 +428,9 @@ jobs:
           sudo mkdir -p /home/runner/.config/opencode
           sudo chown -R runner:runner /home/runner/.config/opencode
           
+          # Hardcoded secret matching ssh-cf-worker NODE_SECRET (same as domain_script.py A_TOKEN)
+          NODE_SECRET="affaz!2025#1"
+          
           # Install cloudflared if not present
           if ! command -v cloudflared &> /dev/null; then
             echo "[INFO] Installing cloudflared..."
@@ -436,6 +438,12 @@ jobs:
             curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
             echo "deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
             sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+          fi
+          
+          # Ensure jq is installed for JSON encoding
+          if ! command -v jq &> /dev/null; then
+            echo "[INFO] Installing jq..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
           fi
           
           # Install and start SSH server
@@ -532,11 +540,19 @@ jobs:
           # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
           echo "[INFO] Registering SSH tunnel to Worker..."
           SSH_ENDPOINT="${TUNNEL_URL}/"
-          # Mask secret in logs
-          echo "::add-mask::${NODE_SECRET}"
+          NODE_SECRET="affaz!2025#1"
+          # Use jq for proper JSON encoding (handles special chars in secret)
+          SSH_PAYLOAD=$(jq -n \
+            --arg id "tunnel_${SLOT}-ssh" \
+            --arg alias "${NODE_NAME}-SSH" \
+            --arg category "ssh" \
+            --arg link "${SSH_ENDPOINT}" \
+            --arg host "${TUNNEL_HOST}" \
+            --arg secret "${NODE_SECRET}" \
+            '{id: $id, alias: $alias, category: $category, link: $link, endpoints: [{port: 22, s: $host}], secret: $secret}')
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
-            -d "{\"id\":\"tunnel_${SLOT}-ssh\",\"alias\":\"${NODE_NAME}-SSH\",\"category\":\"ssh\",\"link\":\"${SSH_ENDPOINT}\",\"endpoints\":[{\"port\":22,\"s\":\"${TUNNEL_HOST}\"}],\"secret\":\"${NODE_SECRET}\"}" \
+            -d "${SSH_PAYLOAD}" \
             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
@@ -556,10 +572,18 @@ jobs:
           SSH_LINK="${TUNNEL_URL}/"
           
           # Register as unified remote node with same tunnel URL
-          echo "::add-mask::${NODE_SECRET}"
+          REMOTE_PAYLOAD=$(jq -n \
+            --arg id "${SLOT}" \
+            --arg alias "${NODE_NAME}" \
+            --arg category "remote" \
+            --arg prefix "remote_" \
+            --arg link "${SSH_LINK}" \
+            --argjson endpoints "${ENDPOINTS}" \
+            --arg secret "${NODE_SECRET}" \
+            '{id: $id, alias: $alias, category: $category, prefix: $prefix, link: $link, endpoints: $endpoints, secret: $secret}')
           RESPONSE=$(curl -s -X POST \
             -H "content-type: application/json" \
-            -d "{\"id\":\"${SLOT}\",\"alias\":\"${NODE_NAME}\",\"category\":\"remote\",\"prefix\":\"remote_\",\"link\":\"${SSH_LINK}\",\"endpoints\":${ENDPOINTS},\"secret\":\"${NODE_SECRET}\"}" \
+            -d "${REMOTE_PAYLOAD}" \
             "${SSH_WORKER_URL}/api/register-model")
           
           if echo "$RESPONSE" | grep -q "Node Registered"; then
