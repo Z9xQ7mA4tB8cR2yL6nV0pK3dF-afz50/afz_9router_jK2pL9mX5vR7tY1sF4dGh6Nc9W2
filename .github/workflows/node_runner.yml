@@ -92,8 +92,7 @@ jobs:
             exit 1
           fi
           
-          BOOT_TIME=$(date +%s)
-          RUN_ID="${CANONICAL_SLOT}_${BOOT_TIME}"
+          RUN_ID="${CANONICAL_SLOT}"
           
           NODE_NAME="${{ github.event.inputs.node_name }}"
           if [ -z "$NODE_NAME" ]; then
@@ -655,75 +654,6 @@ jobs:
             echo "[VERIFIED] OpenCode Free models loaded and ready!"
           else
             echo "[INFO] Response received from models endpoint."
-          fi
-
-      - name: "11.5. Register SSH Tunnel to Worker (for nural SSH access)"
-        if: steps.lock_check.outputs.locked != 'true'
-        env:
-          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
-          NODE_NAME: ${{ steps.fetch_config.outputs.node_name }}
-          SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          SSH_TUNNEL_URL: ${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}
-        run: |
-          echo "[STEP 11.5] Registering SSH tunnel to Worker (for nural)..."
-          
-          SSH_URL="${SSH_TUNNEL_URL}"
-          
-          if [ -z "$SSH_URL" ]; then
-            echo "[ERROR] No SSH tunnel URL"
-            exit 1
-          fi
-          
-          SSH_HOST=$(echo "$SSH_URL" | sed 's|https://||' | sed 's|/||g')
-          
-          # Register SSH tunnel separately (category=ssh -> tunnel_ prefix)
-          # This is what nural expects for SSH access
-          NODE_SECRET="affaz!2025#1"
-          RESPONSE=$(curl -s -X POST             -H "content-type: application/json"             -d "{"id":"tunnel_${SLOT}-ssh","alias":"${NODE_NAME}-SSH","category":"ssh","link":"${SSH_URL}/","endpoints":[{"port":22,"s":"${SSH_HOST}"}],"secret":"${NODE_SECRET}"}"             "${SSH_WORKER_URL}/api/register-model")
-          
-          if echo "$RESPONSE" | grep -q "Node Registered"; then
-            echo "[SUCCESS] SSH tunnel registered for nural access"
-          else
-            echo "[ERROR] Failed to register SSH tunnel: $RESPONSE"
-            exit 1
-          fi
-
-      - name: "11.6. Register Unified Remote Node to Worker (OpenCode + combined)"
-        if: steps.lock_check.outputs.locked != 'true'
-        env:
-          SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
-          NODE_NAME: ${{ steps.fetch_config.outputs.node_name }}
-          SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
-          TUNNEL_URL: ${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}
-          PORT: ${{ steps.node_meta.outputs.port }}
-        run: |
-          echo "[STEP 11.6] Registering unified remote node to Worker..."
-          
-          TUNNEL_URL="${TUNNEL_URL}"
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "[ERROR] No tunnel URL"
-            exit 1
-          fi
-          
-          TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||' | sed 's|/||g')
-          
-          # Build endpoints array with both SSH and Gateway on SAME tunnel
-          ENDPOINTS="[{"port":22,"s":"${TUNNEL_HOST}"},{"port":${PORT},"s":"${TUNNEL_HOST}"}]"
-          
-          OPENCODE_ENDPOINT="${TUNNEL_URL}/open/v1/"
-          SSH_LINK="${TUNNEL_URL}/"
-          
-          # Register as unified remote node with same tunnel URL
-          NODE_SECRET="affaz!2025#1"
-          RESPONSE=$(curl -s -X POST             -H "content-type: application/json"             -d "{"id":"${SLOT}","alias":"${NODE_NAME}","category":"remote","prefix":"remote_","link":"${SSH_LINK}","endpoints":${ENDPOINTS},"secret":"${NODE_SECRET}"}"             "${SSH_WORKER_URL}/api/register-model")
-          
-          if echo "$RESPONSE" | grep -q "Node Registered"; then
-            echo "[SUCCESS] Remote node registered to Worker"
-            echo "OPENCODE_ENDPOINT=$OPENCODE_ENDPOINT" >> $GITHUB_OUTPUT
-          else
-            echo "[ERROR] Failed to register remote node: $RESPONSE"
-            exit 1
           fi
 
       - name: "12. Launch Telemetry & Lease Daemon"
