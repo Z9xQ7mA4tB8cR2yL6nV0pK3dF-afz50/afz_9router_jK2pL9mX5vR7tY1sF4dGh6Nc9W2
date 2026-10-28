@@ -421,13 +421,13 @@ jobs:
           SSH_WORKER_URL: https://affaz-ssh.cmt202150.workers.dev
           PORT: ${{ steps.node_meta.outputs.port }}
         run: |
-          echo "[STEP 7.7] Setting up SSH access via Cloudflare Tunnel + registering to Worker..."
+          echo "[STEP 7.7] Setting up SSH access via Cloudflare quick tunnel + registering remote_node..."
           
           # Fix OpenCode config directory permissions
           sudo mkdir -p /home/runner/.config/opencode
           sudo chown -R runner:runner /home/runner/.config/opencode
           
-          # Hardcoded secret matching ssh-cf-worker NODE_SECRET (same as domain_script.py A_TOKEN)
+          # Hardcoded secret matching ssh-cf-worker NODE_SECRET
           NODE_SECRET="affaz!2025#1"
           
           # Install cloudflared if not present
@@ -473,11 +473,10 @@ jobs:
             exit 1
           fi
           
-          # Start cloudflared quick tunnel for BOTH SSH (port 22) and Gateway (port 6002/6003)
-          echo "[INFO] Starting Cloudflare quick tunnel for SSH + Gateway..."
+          # Start cloudflared quick tunnel for SSH ONLY (nural access)
+          echo "[INFO] Starting Cloudflare quick tunnel for SSH..."
           TUNNEL_OUTPUT=$(mktemp)
-          # Single tunnel with multiple ingress rules
-          cloudflared tunnel --url ssh://localhost:22 --url http://localhost:$PORT --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
+          cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > "$TUNNEL_OUTPUT" 2>&1 &
           TUNNEL_PID=$!
           
           # Wait for tunnel to be ready and extract URL with retry for 429 rate limit
