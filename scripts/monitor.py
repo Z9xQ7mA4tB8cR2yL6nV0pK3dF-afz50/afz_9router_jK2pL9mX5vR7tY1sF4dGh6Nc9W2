@@ -1428,20 +1428,28 @@ def cmd_run_daemon(args):
     R2_REGISTER_INTERVAL = 30  # seconds
 
     while True:
-        snap = state.get_snapshot()
-        if not snap["is_running"]:
-            break
+        try:
+            snap = state.get_snapshot()
+            if not snap["is_running"]:
+                break
 
-        # Periodic R2 re-registration to keep last_seen fresh (every 30s)
-        current_time = time.time()
-        if current_time - last_r2_register >= R2_REGISTER_INTERVAL:
-            register_remote_node_to_r2(
-                ssh_worker_url, node_secret, slot, node_name, port,
-                ssh_tunnel_url, gateway_tunnel_url
-            )
-            last_r2_register = current_time
+            # Periodic R2 re-registration to keep last_seen fresh (every 30s)
+            current_time = time.time()
+            if current_time - last_r2_register >= R2_REGISTER_INTERVAL:
+                try:
+                    success = register_remote_node_to_r2(
+                        ssh_worker_url, node_secret, slot, node_name, port,
+                        ssh_tunnel_url, gateway_tunnel_url
+                    )
+                    if success:
+                        last_r2_register = current_time
+                        log("R2_REG", f"Periodic re-registration successful for {slot}")
+                    else:
+                        log("R2_REG_WARN", f"Periodic re-registration failed for {slot}, will retry next cycle")
+                except Exception as e:
+                    log("R2_REG_ERR", f"Re-registration exception: {e}, will retry next cycle")
 
-        # Check Local 9Router Engine Health via Bearer Auth
+            # Check Local 9Router Engine Health via Bearer Auth
         is_healthy = False
         models_count = 0
         status = "online"
