@@ -789,7 +789,10 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "provider": primary_provider,
             "providers": active_providers,
             "models": compact_models,
-            "models_count": len(compact_models)
+            "models_count": len(compact_models),
+            "scheduled_restart_time": snap["boot_time"] + (6 * 3600),
+            "start_time": snap["boot_time"],
+            "type": "remote"
         }
         res = redis_setex_json(redis_base, hb_key, 60, hb_payload)
         if res is not None and isinstance(res, dict) and res.get("SETEX") == [True, "OK"]:
@@ -958,6 +961,82 @@ def register_remote_node_to_r2(ssh_worker_url: str, node_secret: str, slot: str,
     except Exception as e:
         log("R2_REG_ERR", f"Registration exception: {e}")
         return False
+
+def get_cpu_usage_cgroup(sample_interval=0.5):
+    path_stat = "/sys/fs/cgroup/cpu.stat"
+    path_max = "/sys/fs/cgroup/cpu.max"
+    cpu_count = 1
+    try:
+        with open(path_max, "r") as f:
+            parts = f.read().strip().split()
+            if len(parts) == 2 and parts[0] != "max":
+                cpu_count = int(parts[0]) / int(parts[1])
+    except Exception:
+        pass
+    start_usage = 0
+    try:
+        with open(path_stat, "r") as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    start_usage = int(line.split()[1])
+                    break
+    except Exception:
+        pass
+    time.sleep(sample_interval)
+    end_usage = 0
+    try:
+        with open(path_stat, "r") as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    end_usage = int(line.split()[1])
+                    break
+    except Exception:
+        pass
+    usage_delta = end_usage - start_usage
+    time_delta = sample_interval * 1_000_000
+    total_percent = (usage_delta / time_delta) * 100 if time_delta > 0 else 0
+    normalized_percent = round(total_percent / cpu_count, 1) if cpu_count else 0.0
+    if normalized_percent > 100:
+        normalized_percent = 100.0
+    cpu_c_display = int(cpu_count) if isinstance(cpu_count, float) and cpu_count.is_integer() else cpu_count
+    return normalized_percent, cpu_c_display
+
+def get_memory_cgroup():
+    mem_used = 0
+    mem_limit = 0
+    try:
+        with open("/sys/fs/cgroup/memory.current", "r") as f:
+            mem_used = int(f.read().strip())
+    except Exception:
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r") as f:
+            val = f.read().strip()
+            if val and "max" not in val:
+                mem_limit = int(val)
+    except Exception:
+        pass
+    if not mem_limit:
+        mem_limit = 16 * (1024 ** 3)
+    ram_percent = round((mem_used / mem_limit) * 100, 1) if mem_limit > 0 else 0.0
+    ram_used_gb = f"{mem_used / (1024 ** 3):.2f}"
+    ram_total_gb = f"{mem_limit / (1024 ** 3):.2f}"
+    return ram_percent, ram_used_gb, ram_total_gb
+
+def send_remote_health(redis_base: str, slot: str):
+    try:
+        cpu_p, cpu_c = get_cpu_usage_cgroup()
+        ram_p, ram_u, ram_t = get_memory_cgroup()
+        key = f"health:9rt_{slot}"
+        url = f"{redis_base.rstrip('/')}/HSET/{urllib.parse.quote(key, safe='')}/name/{urllib.parse.quote(str(slot), safe='')}/cpu_p/{cpu_p}/cpu_c/{cpu_c}/ram_p/{ram_p}/ram_u/{urllib.parse.quote(str(ram_u), safe='')}/ram_t/{urllib.parse.quote(str(ram_t), safe='')}"
+        res = redis_http_call(url)
+        if res is None:
+            log("HEALTH_WARN", f"Failed to write health key {key}")
+        else:
+            log("HEALTH", f"{key}: CPU {cpu_p}% ({cpu_c} cores) | RAM {ram_p}% ({ram_u}/{ram_t} GB)")
+    except Exception as e:
+        log("HEALTH_ERR", f"Health collection error: {e}")
+
 def cmd_run_daemon(args):
     slot = normalize_slot(args.slot)
     port = args.port or calculate_port(slot)
@@ -1002,7 +1081,10 @@ def cmd_run_daemon(args):
         "pulse": boot_timestamp,
         "uptime": 0,
         "status": "online",
-        "status_msg": "Initializing 9Router engine & background threads..."
+        "status_msg": "Initializing 9Router engine & background threads...",
+        "scheduled_restart_time": boot_timestamp + (6 * 3600),
+        "start_time": boot_timestamp,
+        "type": "remote"
     }
     redis_setex_json(redis_base, hb_key, 60, initial_hb)
     log("INIT", f"Initial heartbeat registered in Redis.")
@@ -1071,6 +1153,7 @@ def cmd_run_daemon(args):
 
     # R2 Re-registration tracking
     last_r2_register = 0
+    last_health_update = 0
     R2_REGISTER_INTERVAL = 30  # seconds
 
     while True:
@@ -1093,6 +1176,14 @@ def cmd_run_daemon(args):
                     log("R2_REG_WARN", f"Periodic re-registration failed for {slot}, will retry next cycle")
             except Exception as e:
                 log("R2_REG_ERR", f"Re-registration exception: {e}, will retry next cycle")
+
+        # Periodic health key update for remote node (every 30s, separate from p1)
+        if current_time - last_health_update >= R2_REGISTER_INTERVAL:
+            try:
+                send_remote_health(redis_base, slot)
+                last_health_update = current_time
+            except Exception as e:
+                log("HEALTH_ERR", f"Health update exception: {e}")
 
         # Check Local 9Router Engine Health via Bearer Auth
         is_healthy = False
