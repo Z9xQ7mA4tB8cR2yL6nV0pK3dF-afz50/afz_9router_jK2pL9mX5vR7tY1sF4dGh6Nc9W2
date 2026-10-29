@@ -596,6 +596,13 @@ def cmd_check_lock(args):
 
     if getattr(args, "force", False):
         log("PREFLIGHT", f"Force flag active! Bypassing lock check for slot '{slot}'...")
+        run_id = getattr(args, "run_id", None)
+        if run_id:
+            result = redis_setex_str(redis_base, lock_key, 60, run_id)
+            if result is None:
+                log("PREFLIGHT", f"WARNING: Failed to claim lock {lock_key} for run_id {run_id}.")
+            else:
+                log("PREFLIGHT", f"Claimed lock {lock_key} for run_id {run_id} (TTL 60s).")
         gh_output = os.environ.get("GITHUB_OUTPUT")
         if gh_output and os.path.exists(gh_output):
             with open(gh_output, "a") as f:
@@ -1296,6 +1303,7 @@ def main():
     p_check = subparsers.add_parser("check-lock", help="Pre-flight check if slot is actively locked")
     p_check.add_argument("--slot", required=True, help="Target slot name (e.g. node-1 or node-3)")
     p_check.add_argument("--force", action="store_true", help="Force run: bypass lock check and take over slot")
+    p_check.add_argument("--run-id", help="Session RUN_ID to claim lock with (used by --force)")
     p_check.add_argument("--redis-base", default=DEFAULT_REDIS_BASE, help="Redis HTTP API base URL")
 
     # Subcommand: run
