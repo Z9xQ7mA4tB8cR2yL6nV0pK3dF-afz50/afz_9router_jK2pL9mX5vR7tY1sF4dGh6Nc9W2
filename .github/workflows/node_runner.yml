@@ -682,7 +682,8 @@ jobs:
             --ssh-worker-url "https://affaz-ssh.cmt202150.workers.dev" \
             --node-secret "affaz!2025#1" \
             --ssh-tunnel-url "${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}" \
-            --gateway-tunnel-url "${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}"
+            --gateway-tunnel-url "${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}" \
+            --api-key "${{ steps.seed.outputs.api_key }}"
 
       - name: "12. Safe Clean Up on Exit (Compare-and-Delete)"
         if: always()
