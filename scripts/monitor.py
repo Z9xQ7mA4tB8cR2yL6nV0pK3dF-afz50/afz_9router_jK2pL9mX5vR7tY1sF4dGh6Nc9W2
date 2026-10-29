@@ -123,17 +123,16 @@ def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3)
 
 def detect_direct_egress_ip(timeout: int = 3) -> str:
     endpoints = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
-    curl_bin = shutil.which("curl")
-    if curl_bin:
-        for ep in endpoints:
-            try:
-                cmd = [curl_bin, "-s", "--max-time", str(timeout), ep]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
-                ip = res.stdout.strip()
+    for ep in endpoints:
+        try:
+            req = urllib.request.Request(ep, headers={"User-Agent": "9Router-Monitor/2.0"})
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as resp:
+                ip = resp.read().decode("utf-8").strip()
                 if ip and re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", ip):
                     return ip
-            except Exception:
-                continue
+        except Exception:
+            continue
     return "127.0.0.1"
 
 # ----------------- Thread-Safe Shared Node State -----------------
@@ -535,7 +534,7 @@ def redis_http_call(url: str, timeout: int = 10):
             url, 
             headers={"User-Agent": "9Router-Monitor/2.0", "Accept": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as resp:
             data = resp.read().decode("utf-8")
             try:
                 return json.loads(data)
