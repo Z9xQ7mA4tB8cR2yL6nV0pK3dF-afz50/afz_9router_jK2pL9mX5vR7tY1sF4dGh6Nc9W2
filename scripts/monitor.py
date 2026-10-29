@@ -946,8 +946,9 @@ def register_remote_node_to_r2(ssh_worker_url: str, node_secret: str, slot: str,
         
         register_url = f"{ssh_worker_url.rstrip('/')}/api/register-model"
         data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(register_url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        req = urllib.request.Request(register_url, data=data, headers={'Content-Type': 'application/json', 'User-Agent': '9Router-Monitor/2.0'}, method='POST')
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=10) as resp:
             if resp.status == 200:
                 log("R2_REG", f"Remote node {tunnel_id} registered to R2 (prefix: {prefix}) with {len(endpoints)} endpoints")
                 return True
