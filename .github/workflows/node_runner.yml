@@ -534,33 +534,8 @@ jobs:
           echo "  Gateway: http://localhost:$PORT"
           echo "========================================================"
           
-          # Register SSH tunnel to Worker (ssh-cf-worker at affaz-ssh.cmt202150.workers.dev)
-          # Uses NODE_SECRET (matches domain_script.py A_TOKEN pattern)
-          echo "[INFO] Registering SSH tunnel to Worker..."
-          SSH_ENDPOINT="${TUNNEL_URL}/"
-          NODE_SECRET="affaz!2025#1"
-          # Use jq for proper JSON encoding (handles special chars in secret)
-          SSH_PAYLOAD=$(jq -n \
-            --arg id "tunnel_${SLOT}-ssh" \
-            --arg alias "${NODE_NAME}-SSH" \
-            --arg category "ssh" \
-            --arg link "${SSH_ENDPOINT}" \
-            --arg host "${TUNNEL_HOST}" \
-            --arg secret "${NODE_SECRET}" \
-            '{id: $id, alias: $alias, category: $category, link: $link, endpoints: [{port: 22, s: $host}], secret: $secret}')
-          RESPONSE=$(curl -s -X POST \
-            -H "content-type: application/json" \
-            -d "${SSH_PAYLOAD}" \
-            "${SSH_WORKER_URL}/api/register-model")
-          
-          if echo "$RESPONSE" | grep -q "Node Registered"; then
-            echo "[SUCCESS] SSH tunnel registered with Worker"
-          else
-            echo "[WARN] Failed to register SSH tunnel: $RESPONSE"
-          fi
-          
-          # Register unified remote node with SAME tunnel URL
-          echo "[INFO] Registering unified remote node to Worker..."
+           # Register unified remote node with SAME tunnel URL
+           echo "[INFO] Registering unified remote node to Worker..."
           GW_HOST="${TUNNEL_HOST}"
           
           # Build endpoints array with both SSH and Gateway on SAME tunnel
