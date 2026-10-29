@@ -792,7 +792,7 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "models_count": len(compact_models),
             "scheduled_restart_time": snap["boot_time"] + (6 * 3600),
             "start_time": snap["boot_time"],
-            "type": "remote"
+            "type": "cpu"
         }
         res = redis_setex_json(redis_base, hb_key, 60, hb_payload)
         if res is not None and isinstance(res, dict) and res.get("SETEX") == [True, "OK"]:
@@ -1030,6 +1030,11 @@ def send_remote_health(redis_base: str, slot: str):
         key = f"health:9rt_{slot}"
         url = f"{redis_base.rstrip('/')}/HSET/{urllib.parse.quote(key, safe='')}/name/{urllib.parse.quote(str(slot), safe='')}/cpu_p/{cpu_p}/cpu_c/{cpu_c}/ram_p/{ram_p}/ram_u/{urllib.parse.quote(str(ram_u), safe='')}/ram_t/{urllib.parse.quote(str(ram_t), safe='')}"
         res = redis_http_call(url)
+        # Set TTL (60s) so stale health keys auto-expire like heartbeat
+        try:
+            redis_http_call(f"{redis_base.rstrip('/')}/EXPIRE/{urllib.parse.quote(key, safe='')}/60")
+        except Exception:
+            pass
         if res is None:
             log("HEALTH_WARN", f"Failed to write health key {key}")
         else:
@@ -1084,7 +1089,7 @@ def cmd_run_daemon(args):
         "status_msg": "Initializing 9Router engine & background threads...",
         "scheduled_restart_time": boot_timestamp + (6 * 3600),
         "start_time": boot_timestamp,
-        "type": "remote"
+        "type": "cpu"
     }
     redis_setex_json(redis_base, hb_key, 60, initial_hb)
     log("INIT", f"Initial heartbeat registered in Redis.")
