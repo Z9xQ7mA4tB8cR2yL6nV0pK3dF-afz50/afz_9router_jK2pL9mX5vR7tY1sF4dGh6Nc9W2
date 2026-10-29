@@ -896,9 +896,13 @@ def register_remote_node_to_r2(ssh_worker_url: str, node_secret: str, slot: str,
     File name: remote_node_X.json (underscore format)
     Uses urllib (stdlib) - no external dependencies.
     """
-    if not ssh_worker_url or not gateway_tunnel_url:
+    if not ssh_worker_url or not (gateway_tunnel_url or ssh_tunnel_url):
         log("R2_REG_WARN", "Missing required URLs for R2 registration")
         return False
+
+    # Fallback: if gateway tunnel URL missing, reuse SSH tunnel URL (combined tunnel)
+    if not gateway_tunnel_url:
+        gateway_tunnel_url = ssh_tunnel_url
     
     try:
         # Unified remote node entry
