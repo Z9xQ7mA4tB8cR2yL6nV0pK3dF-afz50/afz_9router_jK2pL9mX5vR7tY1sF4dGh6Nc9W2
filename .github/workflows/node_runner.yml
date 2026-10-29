@@ -590,10 +590,10 @@ jobs:
           ROUTER_APP_DIR="$(npm root -g)/9router/app"
           if [ -f "$ROUTER_APP_DIR/server.js" ]; then
             echo "[INFO] Starting standalone server on port $ENGINE_PORT..."
-            PORT="$ENGINE_PORT" HOSTNAME="0.0.0.0" node "$ROUTER_APP_DIR/server.js" >> /tmp/runner.log 2>&1 &
+            PORT="$ENGINE_PORT" HOSTNAME="0.0.0.0" HTTP_PROXY="http://127.0.0.1:40001" HTTPS_PROXY="http://127.0.0.1:40001" node "$ROUTER_APP_DIR/server.js" >> /tmp/runner.log 2>&1 &
           else
             echo "[INFO] Starting via 9router CLI in tray/background mode on port $ENGINE_PORT..."
-            9router -p "$ENGINE_PORT" -H 0.0.0.0 --tray -n >> /tmp/runner.log 2>&1 &
+            HTTP_PROXY="http://127.0.0.1:40001" HTTPS_PROXY="http://127.0.0.1:40001" 9router -p "$ENGINE_PORT" -H 0.0.0.0 --tray -n >> /tmp/runner.log 2>&1 &
           fi
           
           echo "[INFO] Starting Local Gateway on public port $PORT (Slot: $SLOT -> Internal: $ENGINE_PORT)..."

@@ -481,6 +481,77 @@ const server = http.createServer((req, res) => {
   req.pipe(proxyReq);
 });
 
+
+// ----------------- WARP ROUTER PROXY (Stage 2) -----------------
+// Local HTTP/HTTPS proxy on 40001. 9Router uses HTTP_PROXY=http://127.0.0.1:40001.
+// Reads /tmp/warp_enabled_<SLOT> flag; ON -> WARP SOCKS5 (40000), OFF -> direct.
+const net = require("net");
+const WARP_ROUTER_PORT = 40001;
+const WARP_FLAG_FILE = `/tmp/warp_enabled_${SLOT}`;
+function warpFlagEnabled() {
+  try { return require("fs").readFileSync(WARP_FLAG_FILE, "utf8").trim() === "true"; }
+  catch { return true; }
+}
+function socks5Connect(host, port, cb) {
+  const socket = net.connect(40000, "127.0.0.1", () => {
+    socket.write(Buffer.from([5, 1, 0]));
+  });
+  socket.once("data", (greeting) => {
+    const hostBuf = Buffer.from(host);
+    const req = Buffer.concat([Buffer.from([5, 1, 0, 3, hostBuf.length]), hostBuf, Buffer.from([(port >> 8) & 0xff, port & 0xff])]);
+    socket.write(req);
+    socket.once("data", (resp) => {
+      if (!resp || resp[1] !== 0) { socket.destroy(); cb(new Error("socks5 connect failed")); return; }
+      cb(null, socket);
+    });
+  });
+  socket.on("error", (e) => cb(e));
+}
+function directConnect(host, port, cb) {
+  const socket = net.connect(port, host, () => cb(null, socket));
+  socket.on("error", (e) => cb(e));
+}
+const warpRouter = http.createServer((req, res) => {
+  let target;
+  try { target = new URL(req.url); } catch (e) { res.writeHead(400); res.end("Bad Request"); return; }
+  const enabled = warpFlagEnabled();
+  const connector = enabled ? socks5Connect : directConnect;
+  connector(target.hostname, parseInt(target.port || (target.protocol === "https:" ? 443 : 80), 10), (err, socket) => {
+    if (err) { res.writeHead(502); res.end(err.message); return; }
+    const headers = { ...req.headers, host: target.host };
+    delete headers["proxy-connection"];
+    const clientReq = http.request({
+      socket,
+      path: target.pathname + target.search,
+      method: req.method,
+      headers,
+      createConnection: () => socket,
+    }, (upRes) => {
+      res.writeHead(upRes.statusCode, upRes.headers);
+      upRes.pipe(res);
+    });
+    clientReq.on("error", (e) => { res.writeHead(502); res.end(e.message); });
+    req.pipe(clientReq);
+  });
+});
+warpRouter.on("connect", (req, clientSocket, head) => {
+  const parts = (req.url || "").split(":");
+  const host = parts[0];
+  const port = parseInt(parts[1] || "443", 10);
+  const enabled = warpFlagEnabled();
+  const connector = enabled ? socks5Connect : directConnect;
+  connector(host, port, (err, socket) => {
+    if (err) { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); return; }
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (head && head.length) socket.write(head);
+    socket.pipe(clientSocket);
+    clientSocket.pipe(socket);
+  });
+});
+warpRouter.listen(WARP_ROUTER_PORT, "127.0.0.1", () => {
+  console.log(`[WARP-ROUTER] Listening on 127.0.0.1:${WARP_ROUTER_PORT} (flag: ${WARP_FLAG_FILE})`);
+});
+
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(
     `[GATEWAY] Active on port ${PORT} for slot '${SLOT}'. Upstream 9Router: ${TARGET_PORT}. Log file: ${LOG_FILE}`

@@ -121,6 +121,21 @@ def detect_warp_egress_ip(proxy_addr: str = "127.0.0.1:40000", timeout: int = 3)
             pass
     return "127.0.0.1"
 
+def detect_direct_egress_ip(timeout: int = 3) -> str:
+    endpoints = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
+    curl_bin = shutil.which("curl")
+    if curl_bin:
+        for ep in endpoints:
+            try:
+                cmd = [curl_bin, "-s", "--max-time", str(timeout), ep]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
+                ip = res.stdout.strip()
+                if ip and re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", ip):
+                    return ip
+            except Exception:
+                continue
+    return "127.0.0.1"
+
 # ----------------- Thread-Safe Shared Node State -----------------
 
 class NodeSharedState:
@@ -138,6 +153,7 @@ class NodeSharedState:
         self.is_healthy = False
         self.active_models_count = 0
         self.warp_ip = "127.0.0.1"
+        self.warp_enabled = True
         self.models_list = []
         self.discovered_models = []
         self.providers = []
@@ -160,6 +176,10 @@ class NodeSharedState:
         with self.lock:
             self.warp_ip = ip
 
+    def update_warp_enabled(self, enabled: bool):
+        with self.lock:
+            self.warp_enabled = enabled
+
     def get_snapshot(self):
         with self.lock:
             return {
@@ -173,8 +193,9 @@ class NodeSharedState:
                 "status_msg": self.status_msg,
                 "is_healthy": self.is_healthy,
                 "models_count": self.active_models_count,
-                "warp_ip": self.warp_ip,
-                "models_list": list(self.models_list),
+            "warp_ip": self.warp_ip,
+            "warp_enabled": self.warp_enabled,
+            "models_list": list(self.models_list),
                 "discovered_models": list(self.discovered_models),
                 "providers": list(self.providers),
                 "is_running": self.is_running
@@ -682,9 +703,36 @@ def command_consumer_worker(state: NodeSharedState, redis_base: str, rl_engine: 
                         ack_payload["message"] = f"WARP IP rotated to {fresh_ip}."
                         log("CMD_CONSUMER", f"WARP IP rotated to: {fresh_ip}")
 
-                    else:
-                        ack_payload["status"] = "ignored"
-                        ack_payload["message"] = f"Action '{action}' not supported or deprecated."
+                    elif action == "warp_toggle":
+                        enable = bool(cmd.get("enable", True))
+                        log("CMD_CONSUMER", f"Executing WARP toggle -> {enable}...")
+                        warp_bin = shutil.which("warp-cli")
+                        if warp_bin:
+                            try:
+                                if enable:
+                                    subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=30)
+                                else:
+                                    subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=30)
+                            except Exception as we:
+                                log("CMD_ERR", f"warp-cli error: {we}")
+                        # Persist flag for routing (Stage 2 router can read it)
+                        redis_setex_str(redis_base, f"warp_enabled:{state.slot}", 86400, "true" if enable else "false")
+                        state.update_warp_enabled(enable)
+                        fresh_ip = detect_warp_egress_ip() if enable else detect_direct_egress_ip()
+                        if enable:
+                            state.update_warp_ip(fresh_ip)
+                        else:
+                            state.update_warp_ip(fresh_ip)
+                        ack_payload["warp_enabled"] = enable
+                        ack_payload["new_ip"] = fresh_ip
+                        ack_payload["message"] = f"WARP {'enabled' if enable else 'disabled'}."
+                        log("CMD_CONSUMER", f"WARP toggled: {enable}, ip={fresh_ip}")
+                        # Persist flag for local router proxy (Stage 2)
+                        try:
+                            with open(f"/tmp/warp_enabled_{state.slot}", "w") as f:
+                                f.write("true" if enable else "false")
+                        except Exception:
+                            pass
 
                 except Exception as cmd_exc:
                     ack_payload["status"] = "error"
@@ -786,6 +834,7 @@ def heartbeat_worker(state: NodeSharedState, redis_base: str, lock_key: str, hb_
             "status": snap["status"],
             "status_msg": snap["status_msg"],
             "warp_ip": snap["warp_ip"],
+            "warp_enabled": snap.get("warp_enabled", True),
             "provider": primary_provider,
             "providers": active_providers,
             "models": compact_models,
@@ -1160,6 +1209,12 @@ def cmd_run_daemon(args):
     last_r2_register = 0
     last_health_update = 0
     R2_REGISTER_INTERVAL = 30  # seconds
+    # Initialize WARP flag file (default ON)
+    try:
+        with open(f"/tmp/warp_enabled_{slot}", "w") as f:
+            f.write("true")
+    except Exception:
+        pass
 
     while True:
         snap = state.get_snapshot()
