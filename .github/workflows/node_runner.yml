@@ -220,7 +220,7 @@ jobs:
           npm install -g 9router
           echo "[INFO] 9Router root: $(npm root -g)/9router"
 
-      - name: "8. Headlessly Pre-Seed Database (OpenCode Models)"
+      - name: "9. Headlessly Pre-Seed Database (OpenCode Models)"
         if: steps.lock_check.outputs.locked != 'true'
         id: seed
         env:
@@ -250,7 +250,7 @@ jobs:
             exit 1
           fi
 
-      - name: "7.5. Setup Cloudflare WARP (Local SOCKS5 Proxy Mode on 127.0.0.1:40000)"
+      - name: "10. Setup Cloudflare WARP (Local SOCKS5 Proxy Mode on 127.0.0.1:40000)"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
           echo "[STEP 7.5] Installing Cloudflare WARP client..."
@@ -355,7 +355,7 @@ jobs:
             exit 1
           fi
 
-      - name: "9. Install Cloudflare Tunnel Client (cloudflared)"
+      - name: "11. Install Cloudflare Tunnel Client (cloudflared)"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
           echo "[STEP 9] Installing Cloudflare Tunnel daemon (cloudflared)..."
@@ -365,7 +365,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
           echo "[SUCCESS] cloudflared $(cloudflared --version) installed and ready for authenticated handshake."
 
-      - name: "10. Start Cloudflare Tunnel (with claimed token)"
+      - name: "12. Start Cloudflare Tunnel (with claimed token)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           TUNNEL_TOKEN: ${{ steps.claim_tunnel.outputs.token }}
@@ -381,7 +381,7 @@ jobs:
             cat /tmp/cloudflared.log
           fi
 
-      - name: "7.6. Install OpenCode CLI"
+      - name: "13. Install OpenCode CLI"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
           echo "[STEP 7.6] Installing OpenCode CLI..."
@@ -391,7 +391,7 @@ jobs:
           opencode --version
           echo "[SUCCESS] OpenCode CLI installed successfully"
 
-      - name: "7.7. Setup OpenCode Proxy Stack (setup.sh)"
+      - name: "14. Setup OpenCode Proxy Stack (setup.sh)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
@@ -412,7 +412,7 @@ jobs:
             --proxy-key affaz \
             --model opencode/deepseek-v4.1-flash-free
             
-      - name: "7.7. Setup Cloudflare Tunnel SSH Access + Register to Worker"
+      - name: "15. Setup Cloudflare Tunnel SSH Access + Register to Worker"
         if: steps.lock_check.outputs.locked != 'true'
         id: ssh_tunnel
         env:
@@ -571,7 +571,7 @@ jobs:
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_OUTPUT
 
-      - name: "9. Launch 9Router Engine (Headless Daemon Mode)"
+      - name: "16. Launch 9Router Engine (Headless Daemon Mode)"
         if: steps.lock_check.outputs.locked != 'true'
         id: start_engine
         env:
@@ -611,7 +611,7 @@ jobs:
             
             echo "========================================================"
 
-      - name: "10. Verify Local 9Router Engine and Models"
+      - name: "17. Verify Local 9Router Engine and Models"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
@@ -630,7 +630,7 @@ jobs:
             echo "[INFO] Response received from models endpoint."
           fi
 
-      - name: "12. Launch Telemetry & Lease Daemon"
+      - name: "18. Launch Telemetry & Lease Daemon"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           NODE: ${{ steps.node_meta.outputs.canonical_slot }}
@@ -660,7 +660,7 @@ jobs:
             --gateway-tunnel-url "${{ steps.ssh_tunnel.outputs.TUNNEL_URL }}" \
             --api-key "${{ steps.seed.outputs.api_key }}"
 
-      - name: "12. Safe Clean Up on Exit (Compare-and-Delete)"
+      - name: "19. Safe Clean Up on Exit (Compare-and-Delete)"
         if: always()
         env:
           REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
