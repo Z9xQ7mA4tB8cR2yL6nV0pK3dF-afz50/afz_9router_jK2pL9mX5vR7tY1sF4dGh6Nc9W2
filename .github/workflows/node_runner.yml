@@ -121,7 +121,8 @@ jobs:
           REDIS_BASE=$(echo "$RESPONSE" | jq -r '.config.redis_base // empty')
           ADMIN_SECRET=$(echo "$RESPONSE" | jq -r '.config.admin_secret // empty')
           WORKER_URL_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.worker_url // empty')
-          HANDSHAKE_TOKEN_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.handshake_token // empty')
+           HANDSHAKE_TOKEN_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.handshake_token // empty')
+           GITHUB_LOG_SHOW_RECEIVED=$(echo "$RESPONSE" | jq -r '.config.github_log_show // "false"')
           NODE_NAME_FROM_CONFIG=$(echo "$RESPONSE" | jq -r '.name // empty')
           
           if [ -z "$REDIS_BASE" ] || [ "$REDIS_BASE" = "null" ]; then
@@ -136,7 +137,8 @@ jobs:
           echo "redis_base=$REDIS_BASE" >> $GITHUB_OUTPUT
           echo "admin_secret=$ADMIN_SECRET" >> $GITHUB_OUTPUT
           echo "worker_url=$WORKER_URL_RECEIVED" >> $GITHUB_OUTPUT
-          echo "handshake_token=$HANDSHAKE_TOKEN_RECEIVED" >> $GITHUB_OUTPUT
+           echo "handshake_token=$HANDSHAKE_TOKEN_RECEIVED" >> $GITHUB_OUTPUT
+           echo "github_log_show=$GITHUB_LOG_SHOW_RECEIVED" >> $GITHUB_OUTPUT
           echo "node_name=$FINAL_NODE_NAME" >> $GITHUB_OUTPUT
           
           echo "[SUCCESS] Config fetched from Worker:"
@@ -201,7 +203,11 @@ jobs:
             -d '{"run_id": "'$RUN_ID'"}' \
             "$WORKER_URL/api/node/$SLOT/tunnel-claim")
           
-          echo "Tunnel Claim Response: $RESPONSE"
+           if [ "${{ steps.fetch_config.outputs.github_log_show }}" = "true" ]; then
+             echo "Tunnel Claim Response: $RESPONSE"
+           else
+             echo "Tunnel Claim Response: ***"
+           fi
           
           TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
@@ -210,8 +216,14 @@ jobs:
             exit 1
           fi
           
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
-          echo "[SUCCESS] Tunnel token acquired: ${TOKEN:0:20}..."
+           echo "token=$TOKEN" >> $GITHUB_OUTPUT
+           echo "::add-mask::$TOKEN"
+           echo "::add-mask::$WORKER_HANDSHAKE_TOKEN"
+           if [ "${{ steps.fetch_config.outputs.github_log_show }}" = "true" ]; then
+             echo "[SUCCESS] Tunnel token acquired: ${TOKEN:0:20}..."
+           else
+             echo "[SUCCESS] Tunnel token acquired: ***"
+           fi
 
       - name: "8. Install 9Router CLI"
         if: steps.lock_check.outputs.locked != 'true'
