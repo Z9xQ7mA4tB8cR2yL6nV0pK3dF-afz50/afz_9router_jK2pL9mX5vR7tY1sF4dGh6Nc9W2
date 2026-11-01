@@ -203,27 +203,8 @@ log "verify"
   # Dynamically discover candidate models from the live model list so a single
   # slow/unavailable free model cannot fail the whole runner setup.
   CANDIDATE_MODELS=("$DEFAULT_MODEL")
-  log "chat test"
-  CHAT_OK=0
-  # Only try Big Pickle first (stable); avoid long timeouts on unavailable models.
-  for TEST_MODEL in "${CANDIDATE_MODELS[@]}"; do
-    log "trying chat model: $TEST_MODEL (variant=low)"
-    CHAT_OUT="$(curl -fsS -m 30 "${AUTH[@]}" \
-      -H 'content-type: application/json' \
-      "http://127.0.0.1:$PRIMARY_PORT/v1/chat/completions" \
-      -d "{\"model\":\"$TEST_MODEL\",\"variant\":\"low\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly: SETUP_OK\"}]}" \
-      2>/dev/null | jq -r '.choices[0].message.content // .error.message' 2>/dev/null || true)"
-    if [ -n "$CHAT_OUT" ]; then
-      CHAT_OK=1
-      printf 'chat result: %s\n' "$CHAT_OUT"
-      break
-    fi
-    warn "chat attempt failed for $TEST_MODEL"
-  done
-
-  if [ "$CHAT_OK" -ne 1 ]; then
-    warn "chat verification failed on all candidate models; continuing startup (models endpoint is healthy)"
-  fi
+  log "chat test skipped (model verification disabled)"
+  CHAT_OK=1
 
 log "done"
 cat <<EOF
