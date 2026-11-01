@@ -177,41 +177,31 @@ log "verify"
   log "models returned: $MODEL_COUNT"
   [ "$MODEL_COUNT" -gt 0 ] || warn "model list empty — opencode provider check koro"
 
-  # Dynamically pick the default model from whatever is actually available now,
-  # instead of relying on a hardcoded model that may disappear from the free list.
+  # Prefer Big Pickle (stable free model) if available; avoid slow/unavailable ones.
   if [ "$MODEL_COUNT" -gt 0 ]; then
-    FIRST_MODEL="$(curl -fsS -m 15 "${AUTH[@]}" \
-      "http://127.0.0.1:$PRIMARY_PORT/v1/models" 2>/dev/null | jq -r '.data[0].id' 2>/dev/null || true)"
-    if [ -n "$FIRST_MODEL" ] && [ "$FIRST_MODEL" != "null" ]; then
-      DEFAULT_MODEL="$FIRST_MODEL"
-      log "dynamic default model selected: $DEFAULT_MODEL"
-      # Persist the live choice into the env file for future restarts.
-      if [ -f "$ENV_FILE" ]; then
-        sed -i "s|^MODEL=.*|MODEL=$DEFAULT_MODEL|" "$ENV_FILE" 2>/dev/null || true
+    if echo "$LIVE_MODELS" | grep -qx "big-pickle"; then
+      DEFAULT_MODEL="big-pickle"
+      log "dynamic default model selected: $DEFAULT_MODEL (Big Pickle)"
+    else
+      FIRST_MODEL="$(curl -fsS -m 15 "${AUTH[@]}" \
+        "http://127.0.0.1:$PRIMARY_PORT/v1/models" 2>/dev/null | jq -r '.data[0].id' 2>/dev/null || true)"
+      if [ -n "$FIRST_MODEL" ] && [ "$FIRST_MODEL" != "null" ]; then
+        DEFAULT_MODEL="$FIRST_MODEL"
+        log "dynamic default model selected: $DEFAULT_MODEL"
       fi
+    fi
+    if [ -f "$ENV_FILE" ]; then
+      sed -i "s|^MODEL=.*|MODEL=$DEFAULT_MODEL|" "$ENV_FILE" 2>/dev/null || true
     fi
   fi
 
   # Dynamically discover candidate models from the live model list so a single
   # slow/unavailable free model cannot fail the whole runner setup.
   CANDIDATE_MODELS=("$DEFAULT_MODEL")
-  LIVE_MODELS="$(curl -fsS -m 15 "${AUTH[@]}" \
-    "http://127.0.0.1:$PRIMARY_PORT/v1/models" 2>/dev/null | jq -r '.data[].id' 2>/dev/null || true)"
-  if [ -n "$LIVE_MODELS" ]; then
-    while IFS= read -r m; do
-      [ -n "$m" ] || continue
-      # de-duplicate
-      if [[ " ${CANDIDATE_MODELS[*]} " != *" $m "* ]]; then
-        CANDIDATE_MODELS+=("$m")
-      fi
-    done <<< "$LIVE_MODELS"
-  fi
-
-  log "chat test"
-  CHAT_OK=0
-  for TEST_MODEL in "${CANDIDATE_MODELS[@]:0:4}"; do
+  # Only try Big Pickle first (stable); avoid long timeouts on unavailable models.
+  for TEST_MODEL in "${CANDIDATE_MODELS[@]}"; do
     log "trying chat model: $TEST_MODEL (variant=low)"
-    CHAT_OUT="$(curl -fsS -m 120 "${AUTH[@]}" \
+    CHAT_OUT="$(curl -fsS -m 30 "${AUTH[@]}" \
       -H 'content-type: application/json' \
       "http://127.0.0.1:$PRIMARY_PORT/v1/chat/completions" \
       -d "{\"model\":\"$TEST_MODEL\",\"variant\":\"low\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly: SETUP_OK\"}]}" \
