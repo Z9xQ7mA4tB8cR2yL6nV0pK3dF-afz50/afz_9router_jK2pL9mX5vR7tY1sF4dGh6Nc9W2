@@ -139,7 +139,8 @@ def seed(custom_combo=None, db_path=None, custom_models=None):
 
     # Generate unique API key for this node (random, not shared)
     import secrets
-    api_key = "sk-" + secrets.token_urlsafe(32)
+    # Use stable env key if provided; otherwise generate random
+    api_key = os.environ.get("ROUTER_API_KEY") or ("sk-" + secrets.token_urlsafe(32))
     cur.execute("""
         INSERT OR REPLACE INTO apiKeys (id, key, name, machineId, isActive, createdAt)
         VALUES ('0243e23f-696e-4b54-a690-1ed6ed4dbb25', ?, 'Default Key', 'cloud-node', 1, datetime('now'))

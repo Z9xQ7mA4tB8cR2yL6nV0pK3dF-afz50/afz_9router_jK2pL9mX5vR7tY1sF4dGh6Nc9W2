@@ -225,8 +225,9 @@ jobs:
         id: seed
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
-          REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
-          INITIAL_PASSWORD: "affaz.${{ steps.node_meta.outputs.port }}"
+           REDIS_BASE: ${{ steps.fetch_config.outputs.redis_base }}
+           INITIAL_PASSWORD: "affaz.${{ steps.node_meta.outputs.port }}"
+           ROUTER_API_KEY: "affaz"
         run: |
           echo "[STEP 8] Running SQLite Seeder..."
           python3 scripts/seed_db.py
