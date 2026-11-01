@@ -178,6 +178,11 @@ log "verify"
   [ "$MODEL_COUNT" -gt 0 ] || warn "model list empty — opencode provider check koro"
 
   # Prefer Big Pickle (stable free model) if available; avoid slow/unavailable ones.
+  LIVE_MODELS=""
+  if [ "$MODEL_COUNT" -gt 0 ]; then
+    LIVE_MODELS="$(curl -fsS -m 15 "${AUTH[@]}" \
+      "http://127.0.0.1:$PRIMARY_PORT/v1/models" 2>/dev/null | jq -r '.data[].id' 2>/dev/null || true)"
+  fi
   if [ "$MODEL_COUNT" -gt 0 ]; then
     if echo "$LIVE_MODELS" | grep -qx "big-pickle"; then
       DEFAULT_MODEL="big-pickle"
@@ -198,6 +203,8 @@ log "verify"
   # Dynamically discover candidate models from the live model list so a single
   # slow/unavailable free model cannot fail the whole runner setup.
   CANDIDATE_MODELS=("$DEFAULT_MODEL")
+  log "chat test"
+  CHAT_OK=0
   # Only try Big Pickle first (stable); avoid long timeouts on unavailable models.
   for TEST_MODEL in "${CANDIDATE_MODELS[@]}"; do
     log "trying chat model: $TEST_MODEL (variant=low)"
