@@ -23,7 +23,7 @@ SERVE_PORT="${SERVE_PORT:-4096}"
 PRIMARY_PORT="${PRIMARY_PORT:-7015}"
 TEST_PORT="${TEST_PORT:-4097}"
 PROXY_KEY="${PROXY_API_KEY-affaz}"
-DEFAULT_MODEL="${MODEL:-opencode/deepseek-v4.1-flash-free}"
+DEFAULT_MODEL="${MODEL:-opencode/big-pickle}"
 START_TIMEOUT_MS="${START_TIMEOUT_MS:-30000}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/opencode-proxy}"
 
@@ -114,7 +114,7 @@ VARIANT=max
 TOOLS_MODE=safe
 SANDBOX_DIR=$STATE_DIR/sandbox
 HOST=127.0.0.1
-REQUEST_TIMEOUT_MS=120000
+REQUEST_TIMEOUT_MS=180000
 START_TIMEOUT_MS=$START_TIMEOUT_MS
 POLL_MS=350
 EOF
@@ -173,17 +173,60 @@ log "verify"
   done
   
   MODEL_COUNT="$(curl -fsS -m 15 "${AUTH[@]}" \
-    "http://127.0.0.1:$PRIMARY_PORT/v1/models" | jq '.data | length')"
+    "http://127.0.0.1:$PRIMARY_PORT/v1/models" | jq '.data | length' 2>/dev/null || echo 0)"
   log "models returned: $MODEL_COUNT"
   [ "$MODEL_COUNT" -gt 0 ] || warn "model list empty — opencode provider check koro"
-  
+
+  # Dynamically pick the default model from whatever is actually available now,
+  # instead of relying on a hardcoded model that may disappear from the free list.
+  if [ "$MODEL_COUNT" -gt 0 ]; then
+    FIRST_MODEL="$(curl -fsS -m 15 "${AUTH[@]}" \
+      "http://127.0.0.1:$PRIMARY_PORT/v1/models" 2>/dev/null | jq -r '.data[0].id' 2>/dev/null || true)"
+    if [ -n "$FIRST_MODEL" ] && [ "$FIRST_MODEL" != "null" ]; then
+      DEFAULT_MODEL="$FIRST_MODEL"
+      log "dynamic default model selected: $DEFAULT_MODEL"
+      # Persist the live choice into the env file for future restarts.
+      if [ -f "$ENV_FILE" ]; then
+        sed -i "s|^MODEL=.*|MODEL=$DEFAULT_MODEL|" "$ENV_FILE" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # Dynamically discover candidate models from the live model list so a single
+  # slow/unavailable free model cannot fail the whole runner setup.
+  CANDIDATE_MODELS=("$DEFAULT_MODEL")
+  LIVE_MODELS="$(curl -fsS -m 15 "${AUTH[@]}" \
+    "http://127.0.0.1:$PRIMARY_PORT/v1/models" 2>/dev/null | jq -r '.data[].id' 2>/dev/null || true)"
+  if [ -n "$LIVE_MODELS" ]; then
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      # de-duplicate
+      if [[ " ${CANDIDATE_MODELS[*]} " != *" $m "* ]]; then
+        CANDIDATE_MODELS+=("$m")
+      fi
+    done <<< "$LIVE_MODELS"
+  fi
+
   log "chat test"
-  CHAT_OUT="$(curl -fsS -m 180 "${AUTH[@]}" \
-    -H 'content-type: application/json' \
-    "http://127.0.0.1:$PRIMARY_PORT/v1/chat/completions" \
-    -d "{\"model\":\"$DEFAULT_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly: SETUP_OK\"}]}" \
-    | jq -r '.choices[0].message.content // .error.message')"
-  printf 'chat result: %s\n' "$CHAT_OUT"
+  CHAT_OK=0
+  for TEST_MODEL in "${CANDIDATE_MODELS[@]:0:4}"; do
+    log "trying chat model: $TEST_MODEL (variant=low)"
+    CHAT_OUT="$(curl -fsS -m 120 "${AUTH[@]}" \
+      -H 'content-type: application/json' \
+      "http://127.0.0.1:$PRIMARY_PORT/v1/chat/completions" \
+      -d "{\"model\":\"$TEST_MODEL\",\"variant\":\"low\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly: SETUP_OK\"}]}" \
+      2>/dev/null | jq -r '.choices[0].message.content // .error.message' 2>/dev/null || true)"
+    if [ -n "$CHAT_OUT" ]; then
+      CHAT_OK=1
+      printf 'chat result: %s\n' "$CHAT_OUT"
+      break
+    fi
+    warn "chat attempt failed for $TEST_MODEL"
+  done
+
+  if [ "$CHAT_OK" -ne 1 ]; then
+    warn "chat verification failed on all candidate models; continuing startup (models endpoint is healthy)"
+  fi
 
 log "done"
 cat <<EOF

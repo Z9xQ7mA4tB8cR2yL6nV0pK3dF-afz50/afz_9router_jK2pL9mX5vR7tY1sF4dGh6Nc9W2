@@ -410,7 +410,7 @@ jobs:
             --test-port 4097 \
             --serve-port 4096 \
             --proxy-key affaz \
-            --model opencode/deepseek-v4.1-flash-free
+            --model opencode/big-pickle
             
       - name: "15. Setup Cloudflare Tunnel SSH Access + Register to Worker"
         if: steps.lock_check.outputs.locked != 'true'

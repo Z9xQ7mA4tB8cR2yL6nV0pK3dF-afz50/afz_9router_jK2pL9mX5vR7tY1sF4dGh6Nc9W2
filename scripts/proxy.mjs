@@ -13,7 +13,7 @@ const DEFAULT_VARIANT = process.env.VARIANT || "max"
 const AGENT = process.env.OPENCODE_AGENT || process.env.PROXY_AGENT || ""
 const TOOLS_MODE = process.env.TOOLS_MODE || "safe"
 const SANDBOX_DIR = process.env.SANDBOX_DIR || "/tmp/opencode-chat"
-const TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 120000)
+const TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 180000)
 const START_TIMEOUT_MS = Number(process.env.START_TIMEOUT_MS || 15000)
 const POLL_MS = Number(process.env.POLL_MS || 350)
 const KEEP_SESSIONS = process.env.KEEP_SESSIONS === "1"
