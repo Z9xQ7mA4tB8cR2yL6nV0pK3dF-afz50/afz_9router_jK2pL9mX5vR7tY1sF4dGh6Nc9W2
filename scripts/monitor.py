@@ -134,11 +134,11 @@ def detect_direct_egress_ip(timeout: int = 3) -> str:
                     for line in body.splitlines():
                         if line.startswith("ip="):
                             ip = line.split("=", 1)[1].strip()
-                            if re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", ip):
+                            if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                                 return ip
                 else:
                     ip = body
-                    if re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", ip):
+                    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                         return ip
             except Exception:
                 continue
@@ -152,11 +152,11 @@ def detect_direct_egress_ip(timeout: int = 3) -> str:
                     for line in body.splitlines():
                         if line.startswith("ip="):
                             ip = line.split("=", 1)[1].strip()
-                            if re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", ip):
+                            if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                                 return ip
                 else:
                     ip = body
-                    if re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", ip):
+                    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                         return ip
         except Exception:
             continue

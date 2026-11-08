@@ -394,21 +394,17 @@ jobs:
             cat /tmp/cloudflared.log
           fi
 
-      - name: "13. Install OpenCode CLI"
+      - name: "13. OpenCode CLI provided by setup.sh (npm)"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[STEP 7.6] Installing OpenCode CLI..."
-          curl -fsSL https://opencode.ai/install | bash
-          export PATH="$HOME/.opencode/bin:$PATH"
-          echo 'export PATH="$HOME/.opencode/bin:$PATH"' >> $HOME/.bashrc
-          opencode --version
-          echo "[SUCCESS] OpenCode CLI installed successfully"
+          echo "[STEP 7.6] OpenCode CLI is installed by setup.sh via npm (universal). Skipping duplicate install."
 
       - name: "14. Setup OpenCode Proxy Stack (setup.sh)"
         if: steps.lock_check.outputs.locked != 'true'
         env:
           PORT: ${{ steps.node_meta.outputs.port }}
           SLOT: ${{ steps.node_meta.outputs.canonical_slot }}
+          OPENCODE_VERSION: "1.19.5"
         run: |
           echo "[STEP 7.7] Running setup.sh to install OpenCode Proxy Stack..."
           SLOT="${{ steps.node_meta.outputs.canonical_slot }}"
@@ -418,7 +414,7 @@ jobs:
           SERVE_PORT=4096
           
           echo "[INFO] Running setup.sh with ports: serve=4096, primary=$PRIMARY_PORT, test=4097..."
-          sudo bash scripts/setup.sh \
+          sudo OPENCODE_VERSION="${OPENCODE_VERSION:-1.19.5}" bash scripts/setup.sh \
             --primary-port $PRIMARY_PORT \
             --test-port 4097 \
             --serve-port 4096 \

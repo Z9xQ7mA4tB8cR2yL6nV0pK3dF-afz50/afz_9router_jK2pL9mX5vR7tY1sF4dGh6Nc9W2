@@ -37,7 +37,7 @@ for f in start.sh stop.sh watchdog.sh status.sh; do
   [ -f "$SCRIPT_DIR/$f" ] || die "$f nei. Puro proxy directory copy koro."
 done
 command -v apt-get >/dev/null || die "ei script Ubuntu/Debian er jonno"
-[[ "$OPENCODE_VERSION" =~ ^1\.[0-9]+\.[0-9]+$ ]] || die "OPENCODE_VERSION must be 1.x, e.g. 1.19.4"
+[[ "$OPENCODE_VERSION" =~ ^(latest|1\.[0-9]+\.[0-9]+)$ ]] || die "OPENCODE_VERSION must be 'latest' or 1.x, e.g. 1.19.5"
 
 # Refuse to fight a foreign process on our ports. Our own stack is allowed.
 check_port_owner() {
@@ -77,18 +77,16 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 755 "$SERVICE_HOME"
 
-log "opencode $OPENCODE_VERSION install (pinned, 1.x)"
-OPENCODE_BIN="$SERVICE_HOME/.opencode/bin/opencode"
-INSTALLED_VERSION=""
-if [ -x "$OPENCODE_BIN" ]; then
-  INSTALLED_VERSION="$(runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" "$OPENCODE_BIN" --version 2>/dev/null | tail -1 || true)"
+log "opencode install (npm, universal)"
+OPENCODE_BIN=""
+if [ "$OPENCODE_VERSION" = "latest" ]; then
+  npm install -g opencode-ai
+else
+  npm install -g "opencode-ai@${OPENCODE_VERSION}"
 fi
-if [ "$INSTALLED_VERSION" != "$OPENCODE_VERSION" ]; then
-  runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" bash -c \
-    "curl -fsSL https://opencode.ai/install | bash -s -- --version $OPENCODE_VERSION --no-modify-path"
-fi
+OPENCODE_BIN="$(npm prefix -g)/bin/opencode"
 [ -x "$OPENCODE_BIN" ] || die "opencode install fail: $OPENCODE_BIN nei"
-log "opencode: $(runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" "$OPENCODE_BIN" --version | tail -1)"
+log "opencode: $("$OPENCODE_BIN" --version | tail -1)"
 
 log "proxy files"
 install -d -m 755 "$APP_DIR"
