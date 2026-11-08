@@ -60,15 +60,16 @@ jobs:
       - name: "1. Checkout Repository"
         uses: actions/checkout@v4
 
-      - name: "2. Set Up Python Environment"
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: "2. Set Up Python Environment (use runner preinstalled)"
+        run: |
+          python3 --version
+          command -v python3
 
-      - name: "3. Set Up Node.js and System Tools"
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+      - name: "3. Verify Node.js (runner preinstalled)"
+        run: |
+          node --version
+          npm --version
+          command -v node
 
       - name: "4. Resolve Dynamic Port (Formula: 6000 + N) and Identity"
         id: node_meta
@@ -225,12 +226,11 @@ jobs:
              echo "[SUCCESS] Tunnel token acquired: ***"
            fi
 
-      - name: "8. Install 9Router CLI"
+      - name: "8. Verify Node/npm (9Router installed after setup.sh)"
         if: steps.lock_check.outputs.locked != 'true'
         run: |
-          echo "[STEP 8] Installing 9Router globally via npm..."
-          npm install -g 9router
-          echo "[INFO] 9Router root: $(npm root -g)/9router"
+          node --version
+          npm --version
 
       - name: "9. Headlessly Pre-Seed Database (OpenCode Models)"
         if: steps.lock_check.outputs.locked != 'true'
@@ -420,7 +420,10 @@ jobs:
             --serve-port 4096 \
             --proxy-key affaz \
             --model opencode/big-pickle
-            
+
+          echo "[STEP 8] Installing 9Router globally via npm (after Node 22 setup)..."
+          sudo npm install -g 9router
+          echo "[INFO] 9Router root: $(npm root -g)/9router"
       - name: "15. Setup Cloudflare Tunnel SSH Access + Register to Worker"
         if: steps.lock_check.outputs.locked != 'true'
         id: ssh_tunnel
